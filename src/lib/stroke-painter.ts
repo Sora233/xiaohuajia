@@ -22,6 +22,8 @@ type StrokeRecord = {
   elapsed: number
   holdMs: number
   duration: number
+  /** 轮廓换过之后，旧笔画不再占用新的目标线 */
+  epoch: number
 }
 
 function requireCtx(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
@@ -49,6 +51,8 @@ export class StrokePainter {
   private liveRaw: Point[] = []
   private colorMode = false
   private snapRadius = 28
+  /** 每次换轮廓就加一，避免旧下标误占新线 */
+  private epoch = 0
   /** 仅供本地核对最近一笔匹配了几段目标线 */
   debugMatchCount = 0
   private animFrame = 0
@@ -91,6 +95,7 @@ export class StrokePainter {
   }) {
     this.contours = opts.contours
     this.index = opts.index
+    this.epoch++
     const ctx = opts.color.getContext('2d', { willReadFrequently: true })
     this.colorData = ctx ? ctx.getImageData(0, 0, opts.color.width, opts.color.height) : null
     this.redraw()
@@ -134,7 +139,14 @@ export class StrokePainter {
       return
     }
 
-    const matched = matchFinishedStroke(raw, this.contours, this.index, this.snapRadius)
+    const taken = this.strokes.flatMap((stroke) =>
+      stroke.epoch === this.epoch
+        ? stroke.pieces
+            .filter((piece) => piece.spans.length > 0)
+            .map((piece) => ({ contourId: piece.contourId, spans: piece.spans }))
+        : [],
+    )
+    const matched = matchFinishedStroke(raw, this.contours, this.index, this.snapRadius, taken)
     this.debugMatchCount = matched?.length ?? 0
     if (!matched) {
       this.strokes.push({
@@ -147,6 +159,7 @@ export class StrokePainter {
         elapsed: 0,
         holdMs: 0,
         duration: FADE_MS,
+        epoch: this.epoch,
       })
     } else {
       this.strokes.push({
@@ -159,6 +172,7 @@ export class StrokePainter {
         elapsed: 0,
         holdMs: HOLD_MS,
         duration: MORPH_MS,
+        epoch: this.epoch,
       })
     }
     this.ensureAnim()
