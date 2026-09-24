@@ -181,6 +181,61 @@ function collapseSquares(skel: Uint8Array, width: number, height: number) {
   }
 }
 
+/**
+ * 细化后斜线经常剩两像素宽，每个点都像分叉，一条直线会被切成很多段。
+ * 邻居已经互相连着的点删掉也不断开，用奇偶两步删，避免把双线一次删光。
+ */
+function removeRedundantPixels(skel: Uint8Array, width: number, height: number) {
+  const ringX = [0, 1, 1, 1, 0, -1, -1, -1]
+  const ringY = [-1, -1, 0, 1, 1, 1, 0, -1]
+  const redundant = (x: number, y: number) => {
+    let present = 0
+    let count = 0
+    for (let k = 0; k < 8; k++) {
+      if (!at(skel, x + ringX[k], y + ringY[k], width, height)) continue
+      present |= 1 << k
+      count++
+    }
+    if (count <= 1) return false
+    let start = 0
+    while ((present & (1 << start)) === 0) start++
+    const stack = [start]
+    let seen = 1 << start
+    let reached = 0
+    while (stack.length) {
+      const k = stack.pop()!
+      reached++
+      for (const d of [1, 7]) {
+        const j = (k + d) & 7
+        const bit = 1 << j
+        if ((present & bit) === 0 || (seen & bit) !== 0) continue
+        seen |= bit
+        stack.push(j)
+      }
+    }
+    return reached === count
+  }
+
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = false
+    for (const parity of [0, 1]) {
+      const kill: number[] = []
+      for (let y = 1; y < height - 1; y++) {
+        const row = y * width
+        for (let x = 1; x < width - 1; x++) {
+          if (((x + y) & 1) !== parity) continue
+          if (!skel[row + x]) continue
+          if (redundant(x, y)) kill.push(row + x)
+        }
+      }
+      if (kill.length === 0) continue
+      changed = true
+      for (const i of kill) skel[i] = 0
+    }
+    if (!changed) break
+  }
+}
+
 /** 删掉从端点伸向分叉、短于 maxSpur 的毛刺，避免抢方向 */
 function pruneSpurs(
   skel: Uint8Array,
@@ -920,6 +975,217 @@ function graftOverlaps(paths: Array<{ points: Point[]; closed: boolean }>) {
   }
 }
 
+/**
+ * 一段折线若从某点离开、又原路折返回到这一点，就把它拆开。
+ * 去程单独成一条（天线、粗线来回的中心），主线从折返点接着走。
+ * 两边离得开的 U 形对不上原路，不会被拆。
+ */
+function confirmsRetrace(points: Point[], j: number, i: number): boolean {
+  const span = i - j
+  if (span < 10) return false
+  const join = points[j]
+  const end = points[i]
+  // 粗线的两条骨架可能隔开几个像素，仍然是同一笔的来回
+  if (Math.hypot(end.x - join.x, end.y - join.y) > 6) return false
+  const tail = points[Math.max(j + 1, i - 5)]
+  const head = points[Math.min(i - 1, j + 5)]
+  const inx = end.x - tail.x
+  const iny = end.y - tail.y
+  const fwx = head.x - join.x
+  const fwy = head.y - join.y
+  const il = Math.hypot(inx, iny) || 1
+  const fl = Math.hypot(fwx, fwy) || 1
+  // 折返时，回来的方向和出发方向相反
+  const dot = (inx / il) * (fwx / fl) + (iny / il) * (fwy / fl)
+  if (dot > -0.35) return false
+  const mid = j + (span >> 1)
+  const far = Math.hypot(points[mid].x - join.x, points[mid].y - join.y)
+  if (far < 14) return false
+  let hits = 0
+  let samples = 0
+  const step = Math.max(1, Math.floor((i - mid) / 12))
+  const probe = Math.max(1, Math.floor((mid - j) / 24))
+  for (let k = mid; k <= i; k += step) {
+    samples++
+    const q = points[k]
+    let best = 1e9
+    for (let t = j; t <= mid; t += probe) {
+      const d = Math.hypot(points[t].x - q.x, points[t].y - q.y)
+      if (d < best) best = d
+      if (best <= 5.5) break
+    }
+    if (best <= 5.5) hits++
+  }
+  return samples >= 3 && hits / samples >= 0.62
+}
+
+function peelOne(points: Point[]): Point[][] {
+  const n = points.length
+  const CELL = 4
+  const buckets = new Map<string, number[]>()
+  for (let i = 0; i < n; i++) {
+    const p = points[i]
+    const key = `${Math.floor(p.x / CELL)},${Math.floor(p.y / CELL)}`
+    const list = buckets.get(key)
+    if (list) list.push(i)
+    else buckets.set(key, [i])
+  }
+
+  const spans: Array<{ j: number; i: number }> = []
+  for (let i = 12; i < n; i += 2) {
+    const p = points[i]
+    const cx = Math.floor(p.x / CELL)
+    const cy = Math.floor(p.y / CELL)
+    let chosen = -1
+    let bestSpan = 0
+    let looked = 0
+    for (let oy = -2; oy <= 2 && looked < 36; oy++) {
+      for (let ox = -2; ox <= 2 && looked < 36; ox++) {
+        const list = buckets.get(`${cx + ox},${cy + oy}`)
+        if (!list) continue
+        for (let k = 0; k < list.length && looked < 36; k++) {
+          const j = list[k]
+          if (j > i - 10) break
+          looked++
+          const span = i - j
+          if (span <= bestSpan) continue
+          if (Math.hypot(points[j].x - p.x, points[j].y - p.y) > 6) continue
+          if (!confirmsRetrace(points, j, i)) continue
+          chosen = j
+          bestSpan = span
+        }
+      }
+    }
+    if (chosen >= 0) spans.push({ j: chosen, i })
+  }
+
+  // 长的折返优先，避免只切掉尖端、把同一条线拆碎
+  spans.sort((a, b) => b.i - b.j - (a.i - a.j))
+  const drop = new Uint8Array(n)
+  const spurs: Point[][] = []
+  for (const span of spans) {
+    let dirty = false
+    const probe = Math.max(1, Math.floor((span.i - span.j) / 8))
+    for (let t = span.j + probe; t <= span.i; t += probe) {
+      if (drop[t]) {
+        dirty = true
+        break
+      }
+    }
+    if (dirty) continue
+    const mid = span.j + ((span.i - span.j) >> 1)
+    const spur = points.slice(span.j, mid + 1)
+    if (spur.length >= 2 && arcLength(spur) >= 16) spurs.push(spur)
+    for (let t = span.j + 1; t <= span.i; t++) drop[t] = 1
+  }
+
+  const main: Point[] = []
+  for (let i = 0; i < n; i++) if (!drop[i]) main.push(points[i])
+  const pieces: Point[][] = []
+  if (main.length >= 2 && arcLength(main) >= 12) pieces.push(main)
+  for (const spur of spurs) pieces.push(spur)
+  return pieces.length > 0 ? pieces : [points]
+}
+
+/**
+ * 折线若贴着已经走过的地方反方向再走一遍（粗线两边，大约 20px 以内），
+ * 丢掉这遍折返，只留先走的那一侧。间距大约在 30px 以内。
+ */
+function dropCoveredReturns(points: Point[]): Point[][] {
+  const n = points.length
+  if (n < 24) return [points]
+  const CELL = 8
+  const buckets = new Map<string, number[]>()
+  for (let i = 0; i < n; i++) {
+    const p = points[i]
+    const key = `${Math.floor(p.x / CELL)},${Math.floor(p.y / CELL)}`
+    const list = buckets.get(key)
+    if (list) list.push(i)
+    else buckets.set(key, [i])
+  }
+  const covered = new Uint8Array(n)
+  for (let i = 16; i < n; i++) {
+    const p = points[i]
+    const cx = Math.floor(p.x / CELL)
+    const cy = Math.floor(p.y / CELL)
+    const back = points[Math.max(0, i - 4)]
+    const ix = p.x - back.x
+    const iy = p.y - back.y
+    const il = Math.hypot(ix, iy) || 1
+    let hit = false
+    for (let oy = -4; oy <= 4 && !hit; oy++) {
+      for (let ox = -4; ox <= 4 && !hit; ox++) {
+        const list = buckets.get(`${cx + ox},${cy + oy}`)
+        if (!list) continue
+        for (let k = 0; k < list.length; k++) {
+          const j = list[k]
+          if (j > i - 14) break
+          const q = points[j]
+          if (Math.hypot(q.x - p.x, q.y - p.y) > 28) continue
+          const ahead = points[Math.min(n - 1, j + 4)]
+          const fx = ahead.x - q.x
+          const fy = ahead.y - q.y
+          const fl = Math.hypot(fx, fy) || 1
+          if ((ix / il) * (fx / fl) + (iy / il) * (fy / fl) < -0.2) {
+            hit = true
+            break
+          }
+        }
+      }
+    }
+    if (hit) covered[i] = 1
+  }
+
+  const pieces: Point[][] = []
+  let cur: Point[] = []
+  let runStart = -1
+  const flushRun = (runEnd: number) => {
+    if (runStart < 0) return
+    const long = runEnd - runStart >= 8
+    if (!long) {
+      for (let t = runStart; t < runEnd; t++) cur.push(points[t])
+    } else if (cur.length > 0) {
+      const jump = Math.hypot(
+        points[runEnd === n ? n - 1 : runEnd].x - cur[cur.length - 1].x,
+        points[runEnd === n ? n - 1 : runEnd].y - cur[cur.length - 1].y,
+      )
+      // 折返删掉之后，前后若隔开，就拆成两段，避免轮廓横着跳过去
+      if (runEnd < n && jump > 36) {
+        pieces.push(cur)
+        cur = []
+      }
+    }
+    runStart = -1
+  }
+  for (let i = 0; i < n; i++) {
+    if (covered[i]) {
+      if (runStart < 0) runStart = i
+      continue
+    }
+    flushRun(i)
+    cur.push(points[i])
+  }
+  flushRun(n)
+  if (cur.length > 0) pieces.push(cur)
+  const usable = pieces.filter((piece) => piece.length >= 2 && arcLength(piece) >= 12)
+  return usable.length > 0 ? usable : [points]
+}
+
+function peelRetraces(paths: Array<{ points: Point[]; closed: boolean }>) {
+  const next: Array<{ points: Point[]; closed: boolean }> = []
+  for (const path of paths) {
+    if (path.closed || path.points.length < 16) {
+      next.push(path)
+      continue
+    }
+    for (const points of peelOne(path.points)) {
+      if (points.length >= 2) next.push({ points, closed: false })
+    }
+  }
+  paths.length = 0
+  for (const path of next) paths.push(path)
+}
+
 function polishPath(points: Point[], closed: boolean): Point[] {
   const simplified = closed ? simplifyClosed(points, 1.2) : simplifyOpen(points, 1.2)
   if (simplified.length < 2) return dedupePoints(points)
@@ -967,6 +1233,7 @@ export function traceContours(
   timings.removeSmall = lap(t)
   t = performance.now()
   collapseSquares(skel, width, height)
+  removeRedundantPixels(skel, width, height)
   timings.collapse = lap(t)
   t = performance.now()
   // 只剪很短的骨架毛刺。再长一点的分叉留给「穿过分叉」去决定要不要接上
@@ -987,6 +1254,10 @@ export function traceContours(
   t = performance.now()
   bridgeGaps(paths)
   graftOverlaps(paths)
+  // 粗线骨架常走出一去一回。拆开之后，露出来的端点再补一次共线缺口
+  peelRetraces(paths)
+  dropNearDuplicates(paths)
+  bridgeGaps(paths)
   timings.bridge = lap(t)
   timings.paths = paths.length
 
@@ -998,7 +1269,20 @@ export function traceContours(
     if (len < minLen || path.points.length < 2) continue
     const points = polishPath(path.points, path.closed)
     if (points.length < 2 || arcLength(points) < minLen) continue
-    contours.push({ id: contours.length, points, closed: path.closed })
+    const pieces = !path.closed && points.length >= 16 ? peelOne(points) : [points]
+    for (const piece of pieces) {
+      const traced = path.closed ? [piece] : dropCoveredReturns(piece)
+      for (const part of traced) {
+        if (part.length < 2 || arcLength(part) < minLen) continue
+        contours.push({ id: contours.length, points: part, closed: path.closed })
+      }
+    }
+  }
+  const opened = contours.map((c) => ({ points: c.points, closed: c.closed }))
+  dropNearDuplicates(opened)
+  contours.length = 0
+  for (const path of opened) {
+    contours.push({ id: contours.length, points: path.points, closed: path.closed })
   }
   timings.polish = lap(t)
   timings.contours = contours.length
