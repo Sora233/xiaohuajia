@@ -236,6 +236,79 @@ function removeRedundantPixels(skel: Uint8Array, width: number, height: number) 
   }
 }
 
+/**
+ * 斜线细化后常剩这种台阶：相邻像素互相只差一格，环上看是两段，其实已经连着。
+ * 追踪会把每个台阶当成岔口，一条斜线就被切成两像素一段。
+ * 只删「两段邻居隔着一个空位、而且这两个邻居本身挨着」的点，十字和 T 形的真分叉不动。
+ */
+function removeStaircases(skel: Uint8Array, width: number, height: number) {
+  const ringX = [0, 1, 1, 1, 0, -1, -1, -1]
+  const ringY = [-1, -1, 0, 1, 1, 1, 0, -1]
+  const adjacent = (i: number, j: number) => {
+    const dx = Math.abs(ringX[i] - ringX[j])
+    const dy = Math.abs(ringY[i] - ringY[j])
+    return Math.max(dx, dy) === 1
+  }
+  const elbow = (x: number, y: number) => {
+    let present = 0
+    let count = 0
+    for (let k = 0; k < 8; k++) {
+      if (!at(skel, x + ringX[k], y + ringY[k], width, height)) continue
+      present |= 1 << k
+      count++
+    }
+    if (count < 3) return false
+    // 从空位起算，避免一段被环绕点拆成两段
+    let shift = 0
+    while (present & (1 << shift)) {
+      shift++
+      if (shift === 8) return false
+    }
+    let runs = 0
+    let runLen = 0
+    for (let s = 0; s < 8; s++) {
+      const on = (present & (1 << ((shift + s) & 7))) !== 0
+      if (on) {
+        runLen++
+        continue
+      }
+      if (runLen === 0) continue
+      runs++
+      runLen = 0
+    }
+    if (runLen > 0) runs++
+    // 环上刚好两截才是台阶。三截以上是十字、T 形这类真分叉
+    if (runs !== 2) return false
+    for (let k = 0; k < 8; k++) {
+      if (present & (1 << k)) continue
+      const before = (k + 7) & 7
+      const after = (k + 1) & 7
+      if ((present & (1 << before)) === 0 || (present & (1 << after)) === 0) continue
+      if (adjacent(before, after)) return true
+    }
+    return false
+  }
+
+  for (let pass = 0; pass < 12; pass++) {
+    let changed = false
+    for (const parity of [0, 1]) {
+      const kill: number[] = []
+      for (let y = 1; y < height - 1; y++) {
+        const row = y * width
+        for (let x = 1; x < width - 1; x++) {
+          if (((x + y) & 1) !== parity) continue
+          if (!skel[row + x]) continue
+          if (elbow(x, y)) kill.push(row + x)
+        }
+      }
+      if (kill.length === 0) continue
+      changed = true
+      for (const i of kill) skel[i] = 0
+    }
+    if (!changed) break
+  }
+}
+
 /** 删掉从端点伸向分叉、短于 maxSpur 的毛刺，避免抢方向 */
 function pruneSpurs(
   skel: Uint8Array,
@@ -1233,6 +1306,8 @@ export function traceContours(
   timings.removeSmall = lap(t)
   t = performance.now()
   collapseSquares(skel, width, height)
+  removeRedundantPixels(skel, width, height)
+  removeStaircases(skel, width, height)
   removeRedundantPixels(skel, width, height)
   timings.collapse = lap(t)
   t = performance.now()

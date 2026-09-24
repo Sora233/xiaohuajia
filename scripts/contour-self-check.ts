@@ -61,6 +61,22 @@ const h = 80
   assert(arcLength(horizontal.points) > 80, 'T 形横线太短')
 }
 
+// 两像素宽的斜线：台阶不能把一条线切碎，也不能从两端啃掉
+{
+  const img = blank(w, h)
+  for (let i = 0; i < 60; i++) {
+    plot(img, w, 10 + i, 10 + i)
+    plot(img, w, 11 + i, 10 + i)
+  }
+  const contours = summarize('斜台阶', img, w, h)
+  const timings = takeTraceTimings()
+  const longest = contours.reduce((m, c) => Math.max(m, arcLength(c.points)), 0)
+  console.log('斜台阶边', timings?.edges)
+  assert(contours.length === 1, `斜台阶被切成了 ${contours.length} 条`)
+  assert((timings?.edges ?? 999) < 8, `斜台阶仍被切成 ${timings?.edges} 条边`)
+  assert(longest > 55, `斜台阶没有留下整段：${longest.toFixed(0)}`)
+}
+
 // 直角共点：本来就是一条连续骨架，应保持为一条线
 {
   const img = blank(w, h)
