@@ -1,15 +1,11 @@
 import {
-  contourTangent,
-  distanceToOpenEnd,
   queryHits,
   sliceContour,
   type Contour,
-  type NearestHit,
   type SpatialIndex,
 } from '@/lib/contours'
 import {
   arcLength,
-  dist,
   orientPolyline,
   resampleCount,
   slicePolylineByFraction,
@@ -17,281 +13,105 @@ import {
 } from '@/lib/polyline'
 
 export type StrokeMatch = {
-  /** 参与变形的用户笔迹（整笔或其中一段） */
+  /** 参与变形的这一笔（两端离参考线太远的尾巴会去掉） */
   source: Point[]
-  /** 按笔迹方向排好的目标参考线 */
+  /** 同一条参考轮廓上、从笔迹起点投影到终点投影的那一段 */
   target: Point[]
-}
-
-type SampleHit = NearestHit & { dir: number }
-
-type Run = {
-  cid: number
-  from: number
-  to: number
-  startU: number
-  endU: number
-  score: number
-  sampleSpan: number
-  avgAbsDir: number
-  avgDist: number
 }
 
 const SAMPLE_SPACING = 4
 
-function unwrapDelta(d: number, n: number, closed: boolean) {
-  if (!closed || n <= 0) return d
-  let x = d
-  if (x > n / 2) x -= n
-  if (x < -n / 2) x += n
-  return x
+function mod(i: number, n: number) {
+  return ((i % n) + n) % n
 }
 
-function sampleTangents(samples: Point[]): Point[] {
-  return samples.map((_, i) => {
-    const a = samples[Math.max(0, i - 1)]
-    const b = samples[Math.min(samples.length - 1, i + 1)]
-    const l = Math.hypot(b.x - a.x, b.y - a.y) || 1
-    return { x: (b.x - a.x) / l, y: (b.y - a.y) / l }
-  })
+function sampleTangent(samples: Point[], i: number): Point {
+  const a = samples[Math.max(0, i - 1)]
+  const b = samples[Math.min(samples.length - 1, i + 1)]
+  const l = Math.hypot(b.x - a.x, b.y - a.y) || 1
+  return { x: (b.x - a.x) / l, y: (b.y - a.y) / l }
 }
 
-/** 在已知下标附近找更连贯的投影，避免折返轮廓被全局最近点抢走 */
-function projectWindow(
-  contour: Contour,
-  x: number,
-  y: number,
-  hint: number,
-  radius: number,
-): { index: number; dist: number } | null {
+function tangentAt(contour: Contour, index: number): Point {
   const pts = contour.points
   const n = pts.length
-  if (n === 0) return null
-  const win = 18
-  let bestI = -1
-  let bestD = radius + 1
-  if (contour.closed) {
-    const h = ((Math.round(hint) % n) + n) % n
-    for (let k = -win; k <= win; k++) {
-      const i = (h + k + n * 2) % n
-      const d = Math.hypot(pts[i].x - x, pts[i].y - y)
-      if (d < bestD) {
-        bestD = d
-        bestI = i
-      }
-    }
-  } else {
-    const lo = Math.max(0, Math.round(hint) - win)
-    const hi = Math.min(n - 1, Math.round(hint) + win)
-    for (let i = lo; i <= hi; i++) {
-      const d = Math.hypot(pts[i].x - x, pts[i].y - y)
-      if (d < bestD) {
-        bestD = d
-        bestI = i
-      }
-    }
-  }
-  if (bestI < 0 || bestD > radius) return null
-  return { index: bestI, dist: bestD }
+  if (n < 2) return { x: 1, y: 0 }
+  const i = mod(Math.round(index), n)
+  const i0 = contour.closed ? mod(i - 2, n) : Math.max(0, i - 2)
+  const i1 = contour.closed ? mod(i + 2, n) : Math.min(n - 1, i + 2)
+  const l = Math.hypot(pts[i1].x - pts[i0].x, pts[i1].y - pts[i0].y) || 1
+  return { x: (pts[i1].x - pts[i0].x) / l, y: (pts[i1].y - pts[i0].y) / l }
 }
 
-function evaluateContour(
+type Hit = { index: number; dist: number; dir: number }
+
+function hitOn(
+  hits: Array<{ contourId: number; index: number; dist: number }>,
   contour: Contour,
-  samples: Point[],
-  tangents: Point[],
-  hits: SampleHit[][],
+  tangent: Point,
   radius: number,
-): Run | null {
-  const n = contour.points.length
-  if (n < 2) return null
-
-  type Obs = { si: number; idx: number; dist: number; dir: number }
-  const seq: Obs[] = []
-  let hint = -1
-  for (let si = 0; si < samples.length; si++) {
-    const global = hits[si].find((h) => h.contourId === contour.id)
-    let idx = global?.index ?? -1
-    let d = global?.dist ?? Infinity
-    if (hint >= 0) {
-      const local = projectWindow(contour, samples[si].x, samples[si].y, hint, radius)
-      if (local && (idx < 0 || local.dist <= d + 8)) {
-        idx = local.index
-        d = local.dist
-      }
-    }
-    if (idx < 0 || d > radius) continue
-    const tan = contourTangent(contour, idx)
-    const dir = tan.x * tangents[si].x + tan.y * tangents[si].y
-    if (Math.abs(dir) < 0.12 && d > radius * 0.42) continue
-    seq.push({ si, idx, dist: d, dir })
-    hint = idx
-  }
-  if (seq.length < 2) return null
-
-  const deltas: number[] = []
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i].si - seq[i - 1].si > 5) continue
-    deltas.push(unwrapDelta(seq[i].idx - seq[i - 1].idx, n, contour.closed))
-  }
-  let sign = 0
-  if (deltas.length) {
-    const sorted = deltas.slice().sort((a, b) => a - b)
-    sign = Math.sign(sorted[sorted.length >> 1])
-  }
-  if (sign === 0) {
-    sign =
-      Math.sign(unwrapDelta(seq[seq.length - 1].idx - seq[0].idx, n, contour.closed)) ||
-      1
-  }
-
-  let best: Run | null = null
-  let runS = 0
-  let u = seq[0].idx
-  let u0 = u
-  let lastGoodK = 0
-  let lastGoodU = u
-  let stall = 0
-
-  const consider = (end: number, endU: number) => {
-    if (end < runS) return
-    const sampleSpan = seq[end].si - seq[runS].si + 1
-    if (sampleSpan < 2) return
-    let dirSum = 0
-    let distSum = 0
-    const count = end - runS + 1
-    for (let k = runS; k <= end; k++) {
-      dirSum += Math.abs(seq[k].dir)
-      distSum += seq[k].dist
-    }
-    const avgAbsDir = dirSum / count
-    const avgDist = distSum / count
-    const indexSpan = Math.abs(endU - u0)
-    if (indexSpan < 2 && sampleSpan < 4) return
-    if (avgAbsDir < 0.18 && sampleSpan < 6) return
-    const prox = 1 - avgDist / Math.max(1, radius)
-    const score =
-      sampleSpan * (0.45 + avgAbsDir) * (0.4 + prox) + Math.min(indexSpan, sampleSpan * 4) * 0.08
-    if (!best || score > best.score) {
+): Hit | null {
+  let best: Hit | null = null
+  let bestD = radius + 1
+  for (const hit of hits) {
+    if (hit.contourId !== contour.id || hit.dist > radius) continue
+    if (hit.dist < bestD) {
+      bestD = hit.dist
+      const tan = tangentAt(contour, hit.index)
       best = {
-        cid: contour.id,
-        from: seq[runS].si,
-        to: seq[end].si,
-        startU: u0,
-        endU,
-        score,
-        sampleSpan,
-        avgAbsDir,
-        avgDist,
+        index: hit.index,
+        dist: hit.dist,
+        dir: tan.x * tangent.x + tan.y * tangent.y,
       }
     }
-  }
-
-  const restart = (k: number) => {
-    runS = k
-    u = seq[k].idx
-    u0 = u
-    lastGoodK = k
-    lastGoodU = u
-    stall = 0
-  }
-
-  for (let k = 1; k < seq.length; k++) {
-    const prevIdx = ((Math.round(u) % n) + n) % n
-    const du = unwrapDelta(seq[k].idx - prevIdx, n, contour.closed)
-    const forward = du * sign
-    const gap = seq[k].si - seq[k - 1].si
-    const maxForward = 8 + gap * 6
-    if (forward >= 1) stall = 0
-    else stall += Math.max(1, gap) * SAMPLE_SPACING
-    // 下标停住但笔还在往前走：说明已经离开这条轮廓，停在端点附近
-    const parked = forward <= 0 && stall > 24
-    const bad = forward < -4 || forward > maxForward || gap > 8 || parked
-    if (bad) {
-      consider(lastGoodK, lastGoodU)
-      restart(k)
-      continue
-    }
-    u += du
-    if (forward >= 1) {
-      lastGoodK = k
-      lastGoodU = u
-    }
-    consider(lastGoodK, lastGoodU)
   }
   return best
 }
 
-function rangesOverlap(a: Run, b: Run) {
-  const lo = Math.max(a.from, b.from)
-  const hi = Math.min(a.to, b.to)
-  const overlap = hi - lo + 1
-  if (overlap <= 0) return false
-  const aSpan = a.to - a.from + 1
-  const bSpan = b.to - b.from + 1
-  // 只在转角处重叠、两边各自还有一段：这是一笔跨两条线，不是重复匹配
-  if (aSpan - overlap >= 3 && bSpan - overlap >= 3) return false
-  return overlap > 2
-}
-
-function canConnect(
-  prev: Run,
-  next: Run,
-  byId: Map<number, Contour>,
+/**
+ * 从当前下标顺着笔迹方向找下一个投影。
+ * 只往前看一段，避免折返的轮廓把笔吸回已经走过的地方。
+ */
+function projectForward(
+  contour: Contour,
+  x: number,
+  y: number,
+  from: number,
+  sign: number,
   radius: number,
-) {
-  if (next.from - prev.to > 6) return false
-  if (prev.to - next.from > 6) return false
-  const a = byId.get(prev.cid)
-  const b = byId.get(next.cid)
-  if (!a || !b) return false
-  const aPts = sliceContour(a, prev.startU, prev.endU)
-  const bPts = sliceContour(b, next.startU, next.endU)
-  if (aPts.length < 2 || bPts.length < 2) return false
-  const aEnd = aPts[aPts.length - 1]
-  const gap = Math.min(dist(aEnd, bPts[0]), dist(aEnd, bPts[bPts.length - 1]))
-  const joinDist = Math.max(18, Math.min(28, radius * 0.7))
-  if (gap > joinDist) return false
-
-  const aEndIdx = prev.endU >= prev.startU ? prev.endU : prev.startU
-  const bMeetIdx = dist(aEnd, bPts[0]) <= dist(aEnd, bPts[bPts.length - 1]) ? next.startU : next.endU
-  const aAtEnd = a.closed ? gap <= 10 : distanceToOpenEnd(a, aEndIdx) <= 20
-  const bAtEnd = b.closed ? gap <= 10 : distanceToOpenEnd(b, bMeetIdx) <= 20
-  // 直角拐角、分叉处：至少有一端贴着轮廓端点；平行线的中段不会被接上
-  return aAtEnd || bAtEnd || gap <= 8
-}
-
-function buildTarget(parts: Run[], byId: Map<number, Contour>): Point[] {
-  const out: Point[] = []
-  for (const part of parts) {
-    const contour = byId.get(part.cid)
-    if (!contour) continue
-    let pts = sliceContour(contour, part.startU, part.endU)
-    if (pts.length < 2) continue
-    if (out.length === 0) {
-      out.push(...pts)
-      continue
+  maxArc: number,
+): number | null {
+  const pts = contour.points
+  const n = pts.length
+  if (n < 2) return null
+  let best = -1
+  let bestD = radius
+  let arc = 0
+  let i = Math.round(from)
+  const limit = n + 2
+  for (let step = 0; step < limit; step++) {
+    const p = pts[mod(i, n)]
+    const d = Math.hypot(p.x - x, p.y - y)
+    if (d < bestD) {
+      bestD = d
+      best = i
     }
-    const end = out[out.length - 1]
-    if (dist(end, pts[pts.length - 1]) < dist(end, pts[0])) pts = [...pts].reverse()
-    const skip = dist(end, pts[0]) < 1.4 ? 1 : 0
-    for (let i = skip; i < pts.length; i++) out.push(pts[i])
+    if (!contour.closed && ((sign >= 0 && i >= n - 1) || (sign < 0 && i <= 0))) break
+    const next = i + sign
+    if (contour.closed && step > 0 && mod(next, n) === mod(Math.round(from), n)) break
+    const a = pts[mod(i, n)]
+    const b = pts[mod(next, n)]
+    arc += Math.hypot(b.x - a.x, b.y - a.y)
+    if (step > 2 && arc > maxArc) break
+    i = next
   }
-  return out
-}
-
-function plausible(source: Point[], target: Point[]) {
-  const sl = arcLength(source)
-  const tl = arcLength(target)
-  if (tl < 8 || source.length < 2 || target.length < 2) return false
-  if (sl > 56 && tl < sl * 0.12) return false
-  if (tl > sl * 2.6 + 36) return false
-  return true
+  return best < 0 ? null : best
 }
 
 /**
- * 整笔抬起来之后再匹配：按覆盖长度和走向挑轮廓段，
- * 相连的几段会接成一条（或几条）目标线。
- * 没有任何一段落在吸附距离内时返回 null。
+ * 抬笔后只选一条最贴合的参考轮廓。
+ * 目标是这条轮廓上、从笔迹起点的投影走到终点投影的那一整段（拐角也顺着走）。
+ * 整笔变形到这一条线上；只有两端超出吸附距离的部分会丢掉。
  */
 export function matchFinishedStroke(
   raw: Point[],
@@ -303,84 +123,114 @@ export function matchFinishedStroke(
   const strokeLen = arcLength(raw)
   if (strokeLen < 6) return null
 
-  const samples = resampleCount(raw, Math.max(2, Math.round(strokeLen / SAMPLE_SPACING) + 1))
+  const sampleCount = Math.max(2, Math.round(strokeLen / SAMPLE_SPACING) + 1)
+  const samples = resampleCount(raw, sampleCount)
   if (samples.length < 2) return null
-  const tangents = sampleTangents(samples)
   const byId = new Map(contours.map((c) => [c.id, c]))
+  const hits = samples.map((p) => queryHits(p.x, p.y, radius, contours, index))
 
-  const hits: SampleHit[][] = samples.map((p, si) => {
-    const found = queryHits(p.x, p.y, radius, contours, index)
-    const st = tangents[si]
-    return found.map((h) => {
-      const c = byId.get(h.contourId)
-      const tan = c ? contourTangent(c, h.index) : { x: 1, y: 0 }
-      return { ...h, dir: tan.x * st.x + tan.y * st.y }
-    })
-  })
-
-  const nearCount = hits.filter((h) => h.length > 0).length
-  if (nearCount < Math.min(3, samples.length) || nearCount / samples.length < 0.2) return null
-
-  const runs: Run[] = []
-  for (const contour of contours) {
-    const run = evaluateContour(contour, samples, tangents, hits, radius)
-    if (run) runs.push(run)
-  }
-  if (runs.length === 0) return null
-  runs.sort((a, b) => b.score - a.score)
-
-  const chosen: Run[] = []
-  const bestScore = runs[0].score
-  for (const run of runs) {
-    if (run.score < bestScore * 0.2 && run.sampleSpan < samples.length * 0.18) continue
-    if (chosen.some((c) => rangesOverlap(c, run))) continue
-    chosen.push(run)
-  }
-  if (chosen.length === 0) return null
-  chosen.sort((a, b) => a.from - b.from)
-
-  const chains: Run[][] = []
-  for (const run of chosen) {
-    const prev = chains[chains.length - 1]
-    if (prev && canConnect(prev[prev.length - 1], run, byId, radius)) prev.push(run)
-    else chains.push([run])
+  const covered = new Map<number, number>()
+  for (let si = 0; si < samples.length; si++) {
+    const tangent = sampleTangent(samples, si)
+    let bestId = -1
+    let bestScore = 0
+    for (const hit of hits[si]) {
+      if (hit.dist > radius) continue
+      const contour = byId.get(hit.contourId)
+      if (!contour) continue
+      const tan = tangentAt(contour, hit.index)
+      const align = Math.abs(tan.x * tangent.x + tan.y * tangent.y)
+      if (align < 0.12 && hit.dist > radius * 0.55) continue
+      const score = (0.2 + align) * (1.08 - hit.dist / Math.max(1, radius))
+      if (score > bestScore) {
+        bestScore = score
+        bestId = hit.contourId
+      }
+    }
+    if (bestId >= 0) covered.set(bestId, (covered.get(bestId) ?? 0) + SAMPLE_SPACING)
   }
 
-  const matches: StrokeMatch[] = []
-  const spans = chains
-    .map((chain) => ({
-      from: chain[0].from,
-      to: chain[chain.length - 1].to,
-      target: buildTarget(chain, byId),
-    }))
-    .filter((s) => s.target.length >= 2)
-
-  if (spans.length === 0) return null
-
-  if (spans.length === 1) {
-    const span = spans[0]
-    const f0 = span.from / Math.max(1, samples.length - 1)
-    const f1 = span.to / Math.max(1, samples.length - 1)
-    let source = raw.slice()
-    if (!plausible(source, span.target)) source = slicePolylineByFraction(raw, f0, f1)
-    if (!plausible(source, span.target)) return null
-    return [{ source, target: orientPolyline(source, span.target) }]
+  let cid = -1
+  let bestCover = 0
+  for (const [id, len] of covered) {
+    if (len > bestCover) {
+      bestCover = len
+      cid = id
+    }
   }
+  const contour = cid >= 0 ? byId.get(cid) : undefined
+  if (!contour) return null
+  const n = contour.points.length
+  // 贴住的部分太少，就当作没描到线，整笔淡出
+  if (bestCover < Math.max(16, strokeLen * 0.22)) return null
 
-  const cuts = [0]
-  for (let i = 0; i < spans.length - 1; i++) {
-    const mid = (spans[i].to + spans[i + 1].from) / 2
-    cuts.push(mid / Math.max(1, samples.length - 1))
+  let sign = 0
+  let travel = 0
+  let travelN = 0
+  let prevIdx = -1
+  let tangentVote = 0
+  let tangentN = 0
+  for (let si = 0; si < samples.length && travelN < 10; si++) {
+    const hit = hitOn(hits[si], contour, sampleTangent(samples, si), radius)
+    if (!hit) continue
+    if (Math.abs(hit.dir) >= 0.08) {
+      tangentVote += hit.dir
+      tangentN++
+    }
+    if (prevIdx >= 0) {
+      let du = hit.index - prevIdx
+      if (contour.closed) {
+        if (du > n / 2) du -= n
+        if (du < -n / 2) du += n
+      }
+      travel += du
+      travelN++
+    }
+    prevIdx = hit.index
   }
-  cuts.push(1)
+  if (tangentN === 0 && travelN === 0) return null
+  if (Math.abs(travel) >= 2) sign = travel < 0 ? -1 : 1
+  else sign = tangentVote < 0 ? -1 : 1
 
-  for (let i = 0; i < spans.length; i++) {
-    let source = slicePolylineByFraction(raw, cuts[i], cuts[i + 1])
-    const f0 = spans[i].from / Math.max(1, samples.length - 1)
-    const f1 = spans[i].to / Math.max(1, samples.length - 1)
-    if (!plausible(source, spans[i].target)) source = slicePolylineByFraction(raw, f0, f1)
-    if (!plausible(source, spans[i].target)) continue
-    matches.push({ source, target: orientPolyline(source, spans[i].target) })
+  let startU = 0
+  let cursor = 0
+  let firstSi = -1
+  let lastSi = -1
+  let prevSi = -1
+  for (let si = 0; si < samples.length; si++) {
+    if (firstSi < 0) {
+      const hit = hitOn(hits[si], contour, sampleTangent(samples, si), radius)
+      if (!hit) continue
+      startU = hit.index
+      cursor = hit.index
+      firstSi = si
+      lastSi = si
+      prevSi = si
+      continue
+    }
+    const moved = Math.hypot(samples[si].x - samples[prevSi].x, samples[si].y - samples[prevSi].y)
+    const next = projectForward(contour, samples[si].x, samples[si].y, cursor, sign, radius, moved * 3 + 36)
+    if (next === null) continue
+    cursor = next
+    lastSi = si
+    prevSi = si
   }
-  return matches.length ? matches : null
+  if (firstSi < 0 || lastSi <= firstSi) return null
+
+  const denom = Math.max(1, samples.length - 1)
+  let f0 = firstSi / denom
+  let f1 = lastSi / denom
+  if (f0 < 0.06) f0 = 0
+  if (f1 > 0.94) f1 = 1
+  const source =
+    f0 <= 0 && f1 >= 1 ? raw.map((p) => ({ ...p })) : slicePolylineByFraction(raw, f0, f1)
+  let target = sliceContour(contour, startU, cursor)
+  if (source.length < 2 || target.length < 2) return null
+  target = orientPolyline(source, target)
+  const sl = arcLength(source)
+  const tl = arcLength(target)
+  if (tl < 10 || sl < 6) return null
+  // 闭合线不要绕远路，把整圈都算进这一笔
+  if (contour.closed && tl > sl * 1.8 + 36 && tl > arcLength(contour.points) * 0.72) return null
+  return [{ source, target }]
 }

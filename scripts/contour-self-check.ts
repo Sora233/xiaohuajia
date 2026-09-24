@@ -1,6 +1,6 @@
 import { buildSpatialIndex, takeTraceTimings, traceContours } from '@/lib/contours'
 import { matchFinishedStroke } from '@/lib/match-stroke'
-import { arcLength } from '@/lib/polyline'
+import { arcLength, resampleSpacing } from '@/lib/polyline'
 
 function assert(cond: unknown, message: string) {
   if (!cond) throw new Error(message)
@@ -60,15 +60,14 @@ const h = 80
   assert(arcLength(horizontal.points) > 80, 'T 形横线太短')
 }
 
-// 直角：两条边不要因为共点被焊成一条平滑线（拐角应断开或至少保留尖角）
+// 直角共点：本来就是一条连续骨架，应保持为一条线
 {
   const img = blank(w, h)
   hline(img, w, 10, 70, 20)
   vline(img, w, 70, 20, 65)
   const contours = summarize('L 形', img, w, h)
-  assert(contours.length >= 1, 'L 形丢失')
-  const total = contours.reduce((s, c) => s + arcLength(c.points), 0)
-  assert(total > 90, 'L 形总长太短')
+  assert(contours.length === 1, `L 形应是 1 条，实际 ${contours.length}`)
+  assert(arcLength(contours[0].points) > 90, 'L 形总长太短')
 }
 
 // 中间断开 8px，并带一根短毛刺：应接成一条长线，毛刺被丢掉
@@ -114,8 +113,8 @@ const h = 80
   for (let x = 12; x <= 58; x += 3) raw.push({ x, y: 18 + Math.sin(x) * 3 })
   for (let y = 20; y <= 64; y += 3) raw.push({ x: 60 + Math.sin(y / 2) * 3, y })
   const matched = matchFinishedStroke(raw, contours, index, 24)
-  assert(matched && matched.length >= 1, '跨线笔没有匹配')
-  const covered = matched.reduce((s, m) => s + arcLength(m.target), 0)
+  assert(matched && matched.length === 1, `跨线笔应只有一条目标，实际 ${matched?.length ?? 0}`)
+  const covered = arcLength(matched[0].target)
   console.log(
     '跨线目标',
     matched.length,
@@ -127,7 +126,7 @@ const h = 80
   assert(covered > 80, `跨线覆盖太短：${covered.toFixed(1)}`)
 }
 
-// 一笔沿横线再转入竖线：两条轮廓都要被盖住
+// T 形仍是横、竖两条。一笔只顺着横线走，就只得到那一条，不会把竖线也焊进来
 {
   const img = blank(w, h)
   hline(img, w, 8, 96, 16)
@@ -135,26 +134,21 @@ const h = 80
   const contours = traceContours(img, w, h)
   const index = buildSpatialIndex(contours, w, h)
   const raw = []
-  for (let x = 12; x <= 52; x += 3) raw.push({ x, y: 16 + Math.sin(x / 3) * 4 })
-  for (let y = 18; y <= 64; y += 3) raw.push({ x: 52 + Math.sin(y / 2) * 4, y })
+  for (let x = 12; x <= 90; x += 3) raw.push({ x, y: 16 + Math.sin(x / 3) * 4 })
   const matched = matchFinishedStroke(raw, contours, index, 26)
-  assert(matched && matched.length >= 1, 'T 形跨线没有匹配')
-  const covered = matched.reduce((s, m) => s + arcLength(m.target), 0)
+  assert(matched && matched.length === 1, `T 形横线应只有一条目标，实际 ${matched?.length ?? 0}`)
+  const covered = arcLength(matched[0].target)
   console.log(
-    'T 跨线',
+    'T 横线',
     matched.length,
     '覆盖',
     Math.round(covered),
     '轮廓',
     contours.map((c) => Math.round(arcLength(c.points))).join(','),
   )
-  assert(covered > 70, `T 形跨线覆盖太短：${covered.toFixed(1)}`)
-  const target = matched.flatMap((m) => m.target)
-  const minY = Math.min(...target.map((p) => p.y))
-  const maxY = Math.max(...target.map((p) => p.y))
-  const minX = Math.min(...target.map((p) => p.x))
-  const maxX = Math.max(...target.map((p) => p.x))
-  assert(maxX - minX > 30 && maxY - minY > 30, 'T 形跨线没有同时包含横线和竖线')
+  assert(covered > 60, `T 形横线覆盖太短：${covered.toFixed(1)}`)
+  const ys = matched[0].target.map((p) => p.y)
+  assert(Math.max(...ys) - Math.min(...ys) < 18, 'T 形横线被带进了竖线')
 }
 
 // 离线太远应放弃
@@ -199,6 +193,114 @@ const h = 80
   assert(ms < 500, `轮廓提取过慢：${ms.toFixed(0)}ms`)
   assert((timings?.bridge ?? 999) < 200, `补缺过慢：${timings?.bridge}ms`)
   assert(longest > 200, `压力图没有接出长线：${longest.toFixed(0)}`)
+}
+
+function coverRatio(refPts: { x: number; y: number }[], targets: { x: number; y: number }[], tol = 14) {
+  const samples = resampleSpacing(refPts, 4)
+  if (samples.length === 0 || targets.length === 0) return 0
+  const tol2 = tol * tol
+  let hit = 0
+  for (const p of samples) {
+    for (const t of targets) {
+      if ((t.x - p.x) ** 2 + (t.y - p.y) ** 2 <= tol2) {
+        hit++
+        break
+      }
+    }
+  }
+  return hit / samples.length
+}
+
+function wobble(pts: { x: number; y: number }[], amp = 6) {
+  return pts.map((p, i) => {
+    const a = pts[Math.max(0, i - 1)]
+    const b = pts[Math.min(pts.length - 1, i + 1)]
+    const dx = b.x - a.x
+    const dy = b.y - a.y
+    const l = Math.hypot(dx, dy) || 1
+    const w = Math.sin(i / 3.2) * amp
+    return { x: p.x + (-dy / l) * w, y: p.y + (dx / l) * w }
+  })
+}
+
+// 三条边在拐角处断开十几像素：应接成一条线，一笔绕过去只得到这一条，并且盖住描过的范围
+{
+  const W = 360
+  const H = 260
+  const img = blank(W, H)
+  hline(img, W, 30, 200, 40)
+  vline(img, W, 210, 50, 184)
+  hline(img, W, 30, 200, 194)
+  const ref = []
+  for (let x = 30; x <= 200; x += 4) ref.push({ x, y: 40 })
+  for (let y = 40; y <= 194; y += 4) ref.push({ x: 210, y })
+  for (let x = 200; x >= 30; x -= 4) ref.push({ x, y: 194 })
+  const contours = traceContours(img, W, H)
+  const index = buildSpatialIndex(contours, W, H)
+  const raw = wobble(ref, 5)
+  const matched = matchFinishedStroke(raw, contours, index, 28)
+  const targets = matched ? matched[0].target : []
+  const cover = coverRatio(ref, targets, 16)
+  const outLen = matched ? arcLength(matched[0].target) : 0
+  const refLen = arcLength(ref)
+  console.log(
+    '拐角跨线',
+    '轮廓',
+    contours.length,
+    '段',
+    matched?.length ?? 0,
+    '覆盖',
+    cover.toFixed(2),
+    '输出',
+    Math.round(outLen),
+    '参考',
+    Math.round(refLen),
+    '长度比',
+    refLen ? (outLen / refLen).toFixed(2) : '0',
+  )
+  assert(contours.length === 1, `断开的直角没有接成一条，实际 ${contours.length}`)
+  assert(matched && matched.length === 1, '绕框的一笔不应分成多条目标')
+  assert(cover >= 0.85, `绕框覆盖不够：${cover.toFixed(2)}`)
+  assert(outLen >= refLen * 0.85, `绕框输出比描过的范围短：${outLen.toFixed(0)} / ${refLen.toFixed(0)}`)
+}
+
+// 一条长线上隔开的几段：整笔都要留下来
+{
+  const W = 520
+  const H = 80
+  const img = blank(W, H)
+  for (let x0 = 10; x0 < 460; x0 += 90) hline(img, W, x0, x0 + 58, 40)
+  const ref = []
+  for (let x0 = 10; x0 < 460; x0 += 90) {
+    for (let x = x0; x <= x0 + 58; x += 4) ref.push({ x, y: 40 })
+  }
+  const guide = []
+  for (let x = 10; x <= 500; x += 4) guide.push({ x, y: 40 })
+  const contours = traceContours(img, W, H)
+  const index = buildSpatialIndex(contours, W, H)
+  const raw = wobble(guide, 4)
+  const matched = matchFinishedStroke(raw, contours, index, 32)
+  const targets = matched ? matched[0].target : []
+  const cover = coverRatio(ref, targets, 12)
+  const outLen = matched ? arcLength(matched[0].target) : 0
+  const dashLen = 5 * 58
+  console.log(
+    '虚线长笔',
+    '轮廓',
+    contours.length,
+    '段',
+    matched?.length ?? 0,
+    '覆盖',
+    cover.toFixed(2),
+    '输出',
+    Math.round(outLen),
+    '线段',
+    dashLen,
+  )
+  assert(matched && matched.length === 1, '虚线长笔应合成一条目标')
+  assert(contours.length === 1, `共线虚线没有接成一条，实际 ${contours.length}`)
+  assert(cover >= 0.85, `虚线长笔覆盖不够：${cover.toFixed(2)}`)
+  assert(outLen > dashLen * 0.85, `虚线长笔的输出比描过的线段短太多：${outLen.toFixed(0)}`)
 }
 
 console.log('contour self-check ok')
