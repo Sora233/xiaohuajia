@@ -1,0 +1,43 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC',
+    system-ui, sans-serif;
+  --color-ink: #1c1916;
+  --color-paper: #fffaf3;
+  --color-paper-2: #f3eee4;
+  --color-wash: #e8e0d2;
+  --color-line: #d8cfc0;
+  --color-muted: #6f675e;
+  --color-cinnabar: #b5442a;
+  --color-studio: #f4efe6;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--color-ink);
+  background:
+    radial-gradient(1200px 500px at 10% -10%, #fffdf8 0%, transparent 50%),
+    radial-gradient(900px 420px at 100% 0%, #efe6d6 0%, transparent 46%),
+    var(--color-studio);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+a,
+input,
+label {
+  font-family: inherit;
+}
