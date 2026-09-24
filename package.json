@@ -1,6 +1,6 @@
 {
   "name": "xiaohuajia-simulator",
-  "description": "小画家模拟器：乱画的一笔会吸附到参考图最近的轮廓上。",
+  "description": "小画家模拟器：画完一笔后，笔迹会变形成参考图上对应的轮廓。",
   "private": true,
   "version": "0.0.0",
   "type": "module",

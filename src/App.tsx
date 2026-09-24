@@ -88,9 +88,16 @@ function App() {
           .sort((a, b) => b - a)
           .slice(0, 8)
         console.debug('[小画家模拟器] 轮廓', next.contours.length, '最长', lens)
+        if (import.meta.env.DEV) {
+          ;(window as unknown as { __xh?: { contours: typeof next.contours; painter: StrokePainter } }).__xh =
+            {
+              contours: next.contours,
+              painter: painterRef.current,
+            }
+        }
         setHint(
           next.contours.length
-            ? `已提取 ${next.contours.length} 条轮廓。顺着线画，乱笔会吸附上去`
+            ? `已提取 ${next.contours.length} 条轮廓。先画出自己的笔，抬笔后它会变形成参考线`
             : '几乎没提取到轮廓，试试提高「线条细节」',
         )
       } catch (err) {
@@ -135,7 +142,9 @@ function App() {
   )
 
   useEffect(() => {
+    const painter = painterRef.current
     return () => {
+      painter.dispose()
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current)
     }
   }, [])
@@ -243,11 +252,11 @@ function App() {
             《小画家模拟器》
           </h1>
           <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
-            左边是参考，右边顺着轮廓的方向乱画。每一笔都会被掰到最近的参考轮廓上——画得再晃，落纸的也是那条真线。
+            左边是参考，右边顺着轮廓的方向画。画的时候是你自己的线；抬笔后，它会缓缓弯过去，变成对应的参考线。
           </p>
         </div>
         <p className="max-w-xs text-xs leading-relaxed text-muted sm:text-right">
-          空白处超过吸附距离就不会落墨。把所有轮廓描一遍，就能复原整张线稿。
+          一笔可以盖住相连的好几段轮廓。离得太远的乱笔会淡出。
         </p>
       </header>
 
@@ -335,7 +344,7 @@ function App() {
                 </div>
                 <p className="text-sm font-medium text-ink">把图片拖到这里</p>
                 <p className="text-xs text-muted">
-                  也可以点「使用示例图」，先感受吸附效果
+                  也可以点「使用示例图」，看一笔怎么变成线
                 </p>
               </div>
             )}
@@ -350,7 +359,7 @@ function App() {
         <section className="overflow-hidden rounded-2xl border border-line/80 bg-paper shadow-[0_18px_50px_-32px_rgba(28,25,22,0.55)]">
           <div className="flex items-center justify-between border-b border-line/70 px-4 py-2.5">
             <h2 className="text-sm font-medium">临摹画布</h2>
-            <span className="text-[11px] text-muted">笔画吸附到参考轮廓</span>
+            <span className="text-[11px] text-muted">抬笔后变形成参考线</span>
           </div>
           <div className="relative w-full bg-[#fffaf3]" style={{ aspectRatio: aspect }}>
             {!processed && (

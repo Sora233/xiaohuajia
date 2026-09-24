@@ -1,17 +1,27 @@
-import {
-  SnapSession,
-  type Contour,
-  type Point,
-  type SpatialIndex,
-} from '@/lib/contours'
+import type { Contour, SpatialIndex } from '@/lib/contours'
+import { matchFinishedStroke, type StrokeMatch } from '@/lib/match-stroke'
+import { easeInOutCubic, morphPolyline, type Point } from '@/lib/polyline'
 
 const PAPER = '#fffaf3'
 const INK = '#1c1916'
 
-export type StrokeRecord = {
-  snapped: Point[]
+/** 先停一下让人看清自己的笔，再在大约 0.8s 内变过去 */
+const HOLD_MS = 200
+const MORPH_MS = 800
+const FADE_MS = 460
+
+type Phase = 'hold' | 'morph' | 'fade' | 'done'
+
+type StrokeRecord = {
   raw: Point[]
+  pieces: StrokeMatch[]
+  display: Point[][]
   width: number
+  opacity: number
+  phase: Phase
+  elapsed: number
+  holdMs: number
+  duration: number
 }
 
 function requireCtx(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
@@ -25,7 +35,7 @@ function inkWidth(snapRadius: number) {
 }
 
 /**
- * 把用户笔画吸附到参考轮廓上，再当「笔画」画出来（不是揭开窗口）。
+ * 绘制时原样保留用户笔迹；抬笔后匹配参考轮廓，再把这一笔变形过去。
  */
 export class StrokePainter {
   private result: HTMLCanvasElement | null = null
@@ -36,11 +46,13 @@ export class StrokePainter {
   private index: SpatialIndex | null = null
   private colorData: ImageData | null = null
   private strokes: StrokeRecord[] = []
-  private session: SnapSession | null = null
-  private live: Point[] | null = null
   private liveRaw: Point[] = []
   private colorMode = false
   private snapRadius = 28
+  /** 仅供本地核对最近一笔匹配了几段目标线 */
+  debugMatchCount = 0
+  private animFrame = 0
+  private lastNow = 0
   width = 0
   height = 0
 
@@ -49,6 +61,10 @@ export class StrokePainter {
     this.raw = raw
     this.resultCtx = requireCtx(result)
     this.rawCtx = requireCtx(raw)
+  }
+
+  dispose() {
+    this.stopAnim()
   }
 
   resize(width: number, height: number) {
@@ -63,9 +79,8 @@ export class StrokePainter {
       this.raw.height = height
     }
     this.strokes = []
-    this.session = null
-    this.live = null
     this.liveRaw = []
+    this.stopAnim()
     this.redraw()
   }
 
@@ -77,9 +92,7 @@ export class StrokePainter {
     this.contours = opts.contours
     this.index = opts.index
     const ctx = opts.color.getContext('2d', { willReadFrequently: true })
-    this.colorData = ctx
-      ? ctx.getImageData(0, 0, opts.color.width, opts.color.height)
-      : null
+    this.colorData = ctx ? ctx.getImageData(0, 0, opts.color.width, opts.color.height) : null
     this.redraw()
   }
 
@@ -99,63 +112,137 @@ export class StrokePainter {
 
   beginStroke(x: number, y: number) {
     if (!this.index) return
-    this.session = new SnapSession(this.contours, this.index, this.snapRadius)
-    this.session.add(x, y)
-    this.live = this.session.live()
-    this.liveRaw = this.session.raw.slice()
+    this.liveRaw = [{ x, y }]
     this.redraw()
   }
 
   moveStroke(x: number, y: number) {
-    if (!this.session) return
-    this.session.add(x, y)
-    this.live = this.session.live()
-    this.liveRaw = this.session.raw.slice()
+    if (!this.index || this.liveRaw.length === 0) return
+    const last = this.liveRaw[this.liveRaw.length - 1]
+    if (last && Math.hypot(last.x - x, last.y - y) < 0.8) return
+    this.liveRaw.push({ x, y })
     this.redraw()
   }
 
   endStroke() {
-    if (!this.session) return
-    const snapped = this.session.finalize()
-    const raw = this.session.raw.slice()
-    this.session = null
-    this.live = null
+    if (this.liveRaw.length === 0) return
+    const raw = this.liveRaw.slice()
     this.liveRaw = []
-    this.strokes.push({
-      snapped: snapped && snapped.length >= 2 ? snapped : [],
-      raw,
-      width: inkWidth(this.snapRadius),
-    })
+    const width = inkWidth(this.snapRadius)
+    if (raw.length < 2 || !this.index) {
+      this.redraw()
+      return
+    }
+
+    const matched = matchFinishedStroke(raw, this.contours, this.index, this.snapRadius)
+    this.debugMatchCount = matched?.length ?? 0
+    if (!matched) {
+      this.strokes.push({
+        raw,
+        pieces: [],
+        display: [raw],
+        width,
+        opacity: 1,
+        phase: 'fade',
+        elapsed: 0,
+        holdMs: 0,
+        duration: FADE_MS,
+      })
+    } else {
+      this.strokes.push({
+        raw,
+        pieces: matched,
+        display: matched.map((p) => p.source),
+        width,
+        opacity: 1,
+        phase: 'hold',
+        elapsed: 0,
+        holdMs: HOLD_MS,
+        duration: MORPH_MS,
+      })
+    }
+    this.ensureAnim()
     this.redraw()
   }
 
   undo() {
     const last = this.strokes.pop()
     if (!last) return false
+    if (!this.strokes.some((s) => s.phase !== 'done')) this.stopAnim()
     this.redraw()
     return true
   }
 
   clear() {
-    if (this.strokes.length === 0 && !this.session) return
+    if (this.strokes.length === 0 && this.liveRaw.length === 0) return
     this.strokes = []
-    this.session = null
-    this.live = null
     this.liveRaw = []
+    this.stopAnim()
     this.redraw()
   }
 
   resetAll() {
     this.strokes = []
-    this.session = null
-    this.live = null
     this.liveRaw = []
+    this.stopAnim()
     this.redraw()
   }
 
   exportPng(): string {
     if (!this.result) return ''
     return this.result.toDataURL('image/png')
+  }
+
+  private ensureAnim() {
+    if (this.animFrame) return
+    this.lastNow = 0
+    this.animFrame = requestAnimationFrame(this.tick)
+  }
+
+  private stopAnim() {
+    if (this.animFrame) cancelAnimationFrame(this.animFrame)
+    this.animFrame = 0
+    this.lastNow = 0
+  }
+
+  private tick = (now: number) => {
+    const dt = this.lastNow ? Math.min(40, now - this.lastNow) : 16
+    this.lastNow = now
+    let busy = false
+    for (const s of this.strokes) {
+      if (s.phase === 'done') continue
+      busy = true
+      s.elapsed += dt
+      if (s.phase === 'hold') {
+        if (s.elapsed >= s.holdMs) {
+          s.phase = 'morph'
+          s.elapsed = 0
+        }
+      } else if (s.phase === 'morph') {
+        const t = Math.min(1, s.elapsed / s.duration)
+        const eased = easeInOutCubic(t)
+        s.display = s.pieces.map((p) => morphPolyline(p.source, p.target, eased))
+        s.opacity = 1
+        if (t >= 1) {
+          s.phase = 'done'
+          s.display = s.pieces.map((p) => p.target.map((pt) => ({ ...pt })))
+        }
+      } else if (s.phase === 'fade') {
+        const t = Math.min(1, s.elapsed / s.duration)
+        s.opacity = 1 - easeInOutCubic(t)
+        if (t >= 1) {
+          s.phase = 'done'
+          s.opacity = 0
+          s.display = []
+        }
+      }
+    }
+    this.redraw()
+    if (busy) this.animFrame = requestAnimationFrame(this.tick)
+    else {
+      this.animFrame = 0
+      this.lastNow = 0
+    }
   }
 
   private sampleColor(x: number, y: number): string {
@@ -178,6 +265,13 @@ export class StrokePainter {
     width: number,
     colorize: boolean,
   ) {
+    if (pts.length === 1) {
+      ctx.fillStyle = colorize ? this.sampleColor(pts[0].x, pts[0].y) : INK
+      ctx.beginPath()
+      ctx.arc(pts[0].x, pts[0].y, width / 2, 0, Math.PI * 2)
+      ctx.fill()
+      return
+    }
     if (pts.length < 2) return
     ctx.lineCap = 'round'
     ctx.lineJoin = 'round'
@@ -211,6 +305,23 @@ export class StrokePainter {
     ctx.stroke()
   }
 
+  private syncPhaseAttr() {
+    if (!this.result) return
+    const live = this.liveRaw.length > 0
+    const holding = this.strokes.some((s) => s.phase === 'hold')
+    const morphing = this.strokes.some((s) => s.phase === 'morph')
+    const fading = this.strokes.some((s) => s.phase === 'fade')
+    this.result.dataset.phase = live
+      ? 'drawing'
+      : morphing
+        ? 'morph'
+        : holding
+          ? 'hold'
+          : fading
+            ? 'fade'
+            : 'idle'
+  }
+
   redraw() {
     const ctx = this.resultCtx
     if (!ctx || !this.result) return
@@ -220,12 +331,17 @@ export class StrokePainter {
     ctx.fillStyle = PAPER
     ctx.fillRect(0, 0, this.width, this.height)
     for (const s of this.strokes) {
-      this.paintStroke(ctx, s.snapped, s.width, this.colorMode)
+      if (s.opacity <= 0.01 || s.display.length === 0) continue
+      ctx.save()
+      ctx.globalAlpha = s.opacity
+      for (const pts of s.display) this.paintStroke(ctx, pts, s.width, this.colorMode)
+      ctx.restore()
     }
-    if (this.live && this.live.length >= 2) {
-      this.paintStroke(ctx, this.live, inkWidth(this.snapRadius), this.colorMode)
+    if (this.liveRaw.length) {
+      this.paintStroke(ctx, this.liveRaw, inkWidth(this.snapRadius), this.colorMode)
     }
     ctx.restore()
+    this.syncPhaseAttr()
 
     const raw = this.rawCtx
     if (!raw || !this.raw) return
