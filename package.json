@@ -9,6 +9,7 @@
     "build": "tsc -b && vite build",
     "build:single": "tsc -b && vite build --config vite.single.config.ts && node scripts/copy-single.mjs",
     "lint": "oxlint",
+    "check": "node scripts/run-self-check.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

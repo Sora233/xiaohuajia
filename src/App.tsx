@@ -12,6 +12,7 @@ import { Toolbar } from '@/components/Toolbar'
 import {
   loadHtmlImage,
   processSource,
+  ProcessingCancelled,
   type ProcessedImage,
 } from '@/lib/image-process'
 import { SAMPLE_IMAGE_SRC } from '@/lib/sample'
@@ -41,6 +42,7 @@ function App() {
   const [hint, setHint] = useState('先放一张参考图，再顺着线条的大致方向画')
   const brushRef = useRef(brushSize)
   const colorRef = useRef(colorMode)
+  const ingestGen = useRef(0)
 
   const syncRefCanvas = useCallback((image: ProcessedImage) => {
     const canvas = refCanvasRef.current
@@ -73,12 +75,17 @@ function App() {
 
   const ingestImage = useCallback(
     async (img: HTMLImageElement, nextDetail: number, resetDrawing: boolean) => {
+      const gen = ++ingestGen.current
       setProcessing(true)
       setError(null)
-      setHint('正在提取轮廓…')
+      setHint('处理中…')
       try {
+        // 先让「处理中…」画出来，再把重活交给 Worker
         await new Promise((r) => requestAnimationFrame(() => r(null)))
+        await new Promise((r) => window.setTimeout(r, 0))
+        if (gen !== ingestGen.current) return
         const next = await processSource(img, nextDetail)
+        if (gen !== ingestGen.current) return
         imageRef.current = img
         setProcessed(next)
         bindPainter(next, resetDrawing)
@@ -101,10 +108,11 @@ function App() {
             : '几乎没提取到轮廓，试试提高「线条细节」',
         )
       } catch (err) {
+        if (gen !== ingestGen.current || err instanceof ProcessingCancelled) return
         setError(err instanceof Error ? err.message : '处理失败')
         setHint('换一张图片再试试')
       } finally {
-        setProcessing(false)
+        if (gen === ingestGen.current) setProcessing(false)
       }
     },
     [bindPainter, syncRefCanvas],
@@ -349,8 +357,11 @@ function App() {
               </div>
             )}
             {processing && (
-              <div className="absolute inset-0 grid place-items-center bg-paper/70 text-sm text-muted">
-                正在提取轮廓…
+              <div
+                data-testid="processing"
+                className="absolute inset-0 grid place-items-center bg-paper/70 text-sm text-muted"
+              >
+                处理中…
               </div>
             )}
           </button>
