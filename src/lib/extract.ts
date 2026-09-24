@@ -55,8 +55,73 @@ function gaussianBlur5(src: Float32Array, width: number, height: number): Float3
   return out
 }
 
+/** 饱和像素够多就是彩色图。色块不能按黑白线稿整块当墨迹。 */
+function isColorful(data: Uint8ClampedArray): boolean {
+  const n = data.length >> 2
+  if (n === 0) return false
+  let strong = 0
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i]
+    const g = data[i + 1]
+    const b = data[i + 2]
+    if (Math.max(r, g, b) - Math.min(r, g, b) > 28) strong++
+  }
+  return strong / n > 0.06
+}
+
+/** 可分离盒式模糊。窗口在边上按实际像素数归一，避免把线端拉偏。 */
+function boxBlur(src: Float32Array, width: number, height: number, radius: number): Float32Array {
+  const tmp = new Float32Array(src.length)
+  const out = new Float32Array(src.length)
+  const prefix = new Float32Array(Math.max(width, height) + 1)
+  for (let y = 0; y < height; y++) {
+    const row = y * width
+    prefix[0] = 0
+    for (let x = 0; x < width; x++) prefix[x + 1] = prefix[x] + src[row + x]
+    for (let x = 0; x < width; x++) {
+      const a = Math.max(0, x - radius)
+      const b = Math.min(width - 1, x + radius)
+      tmp[row + x] = (prefix[b + 1] - prefix[a]) / (b - a + 1)
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    prefix[0] = 0
+    for (let y = 0; y < height; y++) prefix[y + 1] = prefix[y] + tmp[y * width + x]
+    for (let y = 0; y < height; y++) {
+      const a = Math.max(0, y - radius)
+      const b = Math.min(height - 1, y + radius)
+      out[y * width + x] = (prefix[b + 1] - prefix[a]) / (b - a + 1)
+    }
+  }
+  return out
+}
+
 /**
- * 从 RGBA 像素提取二值线掩膜：照片用 Sobel 边，线稿只用深色墨迹。
+ * 彩色图先拉成灰度，再跟周围比暗多少。
+ * 平涂的头发、衣服和背景亮度接近，不会整块变成墨迹；
+ * 描边、五官和色块交界比周围暗，会留下一条沿着边界的线。
+ * 不然细化会从色块中间穿过去，轮廓就跳到脸上、头发上。
+ */
+function colorLineMask(
+  gray: Float32Array,
+  width: number,
+  height: number,
+  detail: number,
+): Uint8Array {
+  const local = boxBlur(gray, width, height, 6)
+  const tNorm = Math.min(100, Math.max(0, detail)) / 100
+  // 细节越高，越浅的颜色交界也留下
+  const margin = 36 - tNorm * 22
+  const mark = new Uint8Array(gray.length)
+  for (let i = 0; i < gray.length; i++) {
+    if (gray[i] + margin < local[i]) mark[i] = 1
+  }
+  return mark
+}
+
+/**
+ * 从 RGBA 像素提取二值线掩膜。
+ * 黑白线稿只用深色墨迹；彩色图按局部对比留描边；照片用 Sobel 边。
  * `detail`：0–100，越大保留越弱的边。
  */
 export function extractMaskFromRgba(
@@ -70,6 +135,10 @@ export function extractMaskFromRgba(
 
   for (let i = 0, p = 0; i < data.length; i += 4, p++) {
     gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+  }
+
+  if (isColorful(data)) {
+    return { mask: colorLineMask(gray, width, height, detail), lineArt: false }
   }
 
   let extreme = 0
