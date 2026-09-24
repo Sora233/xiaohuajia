@@ -337,6 +337,134 @@ function wobble(pts: { x: number; y: number }[], amp = 6) {
   assert(outLen > dashLen * 0.85, `虚线长笔的输出比描过的线段短太多：${outLen.toFixed(0)}`)
 }
 
+function rangesOverlap(a: Array<[number, number]>, b: Array<[number, number]>) {
+  for (const [a0, a1] of a) {
+    for (const [b0, b1] of b) {
+      if (Math.max(a0, b0) <= Math.min(a1, b1)) return true
+    }
+  }
+  return false
+}
+
+function spansOf(matched: Array<{ spans: Array<[number, number]> }>) {
+  return matched.flatMap((piece) => piece.spans)
+}
+
+function wobbleLine(x0: number, x1: number, y: number, step = 3) {
+  const raw = []
+  const dir = x0 <= x1 ? 1 : -1
+  for (let x = x0; dir > 0 ? x <= x1 : x >= x1; x += dir * step) {
+    raw.push({ x, y: y + Math.sin(x / 5) * 6 })
+  }
+  return raw
+}
+
+// 已经画过的整段，再描一次不应再匹配
+{
+  const img = blank(w, h)
+  hline(img, w, 4, 112, 50)
+  const contours = traceContours(img, w, h)
+  const index = buildSpatialIndex(contours, w, h)
+  const raw = wobbleLine(8, 108, 50)
+  const first = matchFinishedStroke(raw, contours, index, 28)
+  assert(first && first.length === 1, '第一笔应匹配到线')
+  const again = matchFinishedStroke(raw, contours, index, 28, first)
+  console.log('重复描线', again?.length ?? 0)
+  assert(again === null, '已经画上去的线不应再次匹配')
+}
+
+// 先画左半，再描整条：第二次只补右半，不覆盖左半
+{
+  const img = blank(w, h)
+  hline(img, w, 4, 112, 50)
+  const contours = traceContours(img, w, h)
+  const index = buildSpatialIndex(contours, w, h)
+  const left = wobbleLine(8, 58, 50)
+  const full = wobbleLine(8, 108, 50)
+  const first = matchFinishedStroke(left, contours, index, 28)
+  assert(first && first.length === 1, '左半笔没有匹配')
+  const second = matchFinishedStroke(full, contours, index, 28, first)
+  const leftMax = Math.max(...first[0].target.map((p) => p.x))
+  const secondMin = second ? Math.min(...second.flatMap((p) => p.target.map((t) => t.x))) : 0
+  const secondMax = second ? Math.max(...second.flatMap((p) => p.target.map((t) => t.x))) : 0
+  console.log(
+    '补右半',
+    second?.length ?? 0,
+    '左端',
+    Math.round(leftMax),
+    '新段',
+    Math.round(secondMin),
+    Math.round(secondMax),
+    '重叠',
+    second ? rangesOverlap(spansOf(first), spansOf(second)) : false,
+  )
+  assert(second && second.length >= 1, '右半还应匹配到')
+  assert(!rangesOverlap(spansOf(first), spansOf(second)), '新目标与已画段落重叠')
+  assert(secondMin >= leftMax - 3, `新段又回到了已画的左半：${secondMin.toFixed(1)} / ${leftMax.toFixed(1)}`)
+  assert(secondMax > leftMax + 30, '右半没有补上')
+}
+
+// 中间已经画过：整笔跨过去时拆成左右两段，中间不再匹配
+{
+  const img = blank(w, h)
+  hline(img, w, 4, 112, 50)
+  const contours = traceContours(img, w, h)
+  const index = buildSpatialIndex(contours, w, h)
+  const mid = wobbleLine(46, 74, 50)
+  const full = wobbleLine(8, 108, 50)
+  const first = matchFinishedStroke(mid, contours, index, 28)
+  assert(first && first.length === 1, '中间一笔没有匹配')
+  const second = matchFinishedStroke(full, contours, index, 28, first)
+  const midMin = Math.min(...first[0].target.map((p) => p.x))
+  const midMax = Math.max(...first[0].target.map((p) => p.x))
+  const bands = (second ?? [])
+    .map((p) => ({
+      min: Math.min(...p.target.map((t) => t.x)),
+      max: Math.max(...p.target.map((t) => t.x)),
+    }))
+    .sort((a, b) => a.min - b.min)
+  console.log(
+    '跨过中间',
+    second?.length ?? 0,
+    '中段',
+    Math.round(midMin),
+    Math.round(midMax),
+    '新段',
+    bands.map((b) => `${Math.round(b.min)}-${Math.round(b.max)}`).join(','),
+    '重叠',
+    second ? rangesOverlap(spansOf(first), spansOf(second)) : false,
+  )
+  assert(second && second.length === 2, `跨过已画段应留下左右两段，实际 ${second?.length ?? 0}`)
+  assert(!rangesOverlap(spansOf(first), spansOf(second)), '左右两段碰到了已画的中间')
+  assert(bands[0].max < midMin + 4, '左段伸进了已画的中间')
+  assert(bands[1].min > midMax - 4, '右段伸进了已画的中间')
+}
+
+// 横线画过之后，竖线仍能匹配
+{
+  const img = blank(w, h)
+  hline(img, w, 8, 96, 16)
+  vline(img, w, 52, 16, 68)
+  const contours = traceContours(img, w, h)
+  const index = buildSpatialIndex(contours, w, h)
+  const horizontal = []
+  for (let x = 12; x <= 90; x += 3) horizontal.push({ x, y: 16 + Math.sin(x / 3) * 4 })
+  const vertical = []
+  for (let y = 20; y <= 64; y += 3) vertical.push({ x: 52 + Math.sin(y / 2) * 3, y })
+  const across = matchFinishedStroke(horizontal, contours, index, 26)
+  assert(across && across.length === 1, '横线没有先匹配上')
+  const down = matchFinishedStroke(vertical, contours, index, 26, across)
+  const downLen = down ? arcLength(down[0].target) : 0
+  console.log('画过横线后再画竖线', down?.length ?? 0, '长', Math.round(downLen))
+  assert(down && down.length === 1, '另一条线不应因为旁边已经画过就被丢掉')
+  assert(downLen > 30, `竖线剩下的太短：${downLen.toFixed(1)}`)
+  const xs = down[0].target.map((p) => p.x)
+  assert(Math.max(...xs) - Math.min(...xs) < 18, '竖线被带进了已经画过的横线')
+  if (down[0].contourId === across[0].contourId) {
+    assert(!rangesOverlap(spansOf(across), spansOf(down)), '竖线匹配进了已经画过的横线')
+  }
+}
+
 function paper(width: number, height: number) {
   const data = new Uint8ClampedArray(width * height * 4)
   for (let i = 0; i < data.length; i += 4) {

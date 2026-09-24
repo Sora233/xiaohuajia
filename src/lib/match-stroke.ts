@@ -1,17 +1,29 @@
 import { queryHits, sliceContour, type Contour, type SpatialIndex } from '@/lib/contours'
 import {
   arcLength,
+  dedupePoints,
   normalize,
   orientPolyline,
   resampleCount,
+  slicePolylineByFraction,
   type Point,
 } from '@/lib/polyline'
 
+/** 已经画到画布上的一段轮廓，按点下标占用 */
+export type TakenSpan = {
+  contourId: number
+  /** 含端点，按点序；闭合线跨过起点时拆成多段 */
+  spans: Array<[number, number]>
+}
+
 export type StrokeMatch = {
-  /** 整笔都参与变形，长短不够就拉伸或缩短 */
+  /** 整笔都参与变形，长短不够就拉伸或缩短。跨过已画段时只留下还没画的几段 */
   source: Point[]
   /** 同一条参考轮廓上、从笔迹起点投影到终点投影的那一段 */
   target: Point[]
+  contourId: number
+  /** 这一段目标占用的轮廓点，之后的笔不再匹配这些点 */
+  spans: Array<[number, number]>
 }
 
 const SAMPLE_N = 36
@@ -60,6 +72,8 @@ type Built = {
   align: number
   advance: number
   score: number
+  startU: number
+  endU: number
 }
 
 /**
@@ -129,7 +143,9 @@ function buildChain(
   let target: Point[]
   if (contour.closed && Math.abs(endU - startU) >= n * 0.92) {
     const origin = mod(Math.round(startU), n)
-    target = sliceContour(contour, origin, origin + (sign >= 0 ? n : -n))
+    startU = origin
+    endU = origin + (sign >= 0 ? n : -n)
+    target = sliceContour(contour, startU, endU)
   } else {
     target = sliceContour(contour, startU, endU)
   }
@@ -142,6 +158,8 @@ function buildChain(
     if (whole <= 220 && whole > advance + 8 && mean <= searchR * 0.72) {
       target = orientPolyline(near, contour.points.map((p) => ({ ...p })))
       advance = whole
+      startU = 0
+      endU = contour.closed ? n : n - 1
     }
   }
   if (advance < 8) return null
@@ -149,7 +167,7 @@ function buildChain(
   if (align < 0.16 && advance < 40) return null
   if (grazes(advance, near)) return null
   const score = (searchR - mean) * picked.length + align * 10 + Math.min(advance, 1200) * 0.035
-  return { target, mean, covered: picked.length, align, advance, score }
+  return { target, mean, covered: picked.length, align, advance, score, startU, endU }
 }
 
 function projectAhead(
@@ -274,7 +292,7 @@ function followSign(
   if (align < 0.16 && advance < 40) return null
   if (grazes(advance, near)) return null
   const score = (searchR - mean) * near.length + align * 10 + Math.min(advance, 1200) * 0.035
-  return { target, mean, covered: near.length, align, advance, score }
+  return { target, mean, covered: near.length, align, advance, score, startU, endU }
 }
 
 function betterBuilt(a: Built | null, b: Built | null) {
@@ -283,16 +301,24 @@ function betterBuilt(a: Built | null, b: Built | null) {
   return b.score > a.score ? b : a
 }
 
+function indexTaken(mask: Uint8Array | undefined, index: number, n: number) {
+  if (!mask || n === 0) return false
+  return mask[mod(Math.round(index), n)] === 1
+}
+
 function matchContour(
   contour: Contour,
   samples: Point[],
   hits: Array<Array<{ contourId: number; index: number; dist: number }>>,
   searchR: number,
+  mask?: Uint8Array,
 ): Built | null {
   const obs: Obs[] = []
+  const n = contour.points.length
   for (let si = 0; si < samples.length; si++) {
     const hit = hits[si].find((h) => h.contourId === contour.id)
     if (!hit || hit.dist > searchR) continue
+    if (indexTaken(mask, hit.index, n)) continue
     obs.push({ si, index: hit.index, dist: hit.dist })
   }
   if (obs.length < 4) return null
@@ -307,10 +333,148 @@ function matchContour(
   return best
 }
 
+function buildTakenMasks(
+  byId: Map<number, Contour>,
+  taken: readonly TakenSpan[] | undefined,
+): Map<number, Uint8Array> {
+  const masks = new Map<number, Uint8Array>()
+  if (!taken || taken.length === 0) return masks
+  for (const item of taken) {
+    const contour = byId.get(item.contourId)
+    if (!contour || item.spans.length === 0) continue
+    let mask = masks.get(item.contourId)
+    if (!mask) {
+      mask = new Uint8Array(contour.points.length)
+      masks.set(item.contourId, mask)
+    }
+    const n = mask.length
+    for (const [a, b] of item.spans) {
+      const lo = Math.max(0, Math.min(a, b))
+      const hi = Math.min(n - 1, Math.max(a, b))
+      for (let i = lo; i <= hi; i++) mask[i] = 1
+    }
+  }
+  return masks
+}
+
+function walkContourIndices(contour: Contour, startU: number, endU: number): number[] {
+  const n = contour.points.length
+  if (n === 0) return []
+  const span = endU - startU
+  const dir = span >= 0 ? 1 : -1
+  const steps = Math.min(n, Math.max(0, Math.round(Math.abs(span))))
+  const out: number[] = []
+  let i = mod(Math.round(startU), n)
+  for (let s = 0; s <= steps; s++) {
+    out.push(i)
+    if (!contour.closed && (i + dir < 0 || i + dir >= n)) break
+    i = mod(i + dir, n)
+    if (contour.closed && s > 0 && steps >= n && i === mod(Math.round(startU), n)) break
+  }
+  return out
+}
+
+function compressSpans(indices: number[]): Array<[number, number]> {
+  if (indices.length === 0) return []
+  const spans: Array<[number, number]> = []
+  let lo = indices[0]
+  let hi = indices[0]
+  for (let k = 1; k < indices.length; k++) {
+    const i = indices[k]
+    if (i === hi + 1 || i === lo - 1) {
+      lo = Math.min(lo, i)
+      hi = Math.max(hi, i)
+      continue
+    }
+    spans.push([lo, hi])
+    lo = i
+    hi = i
+  }
+  spans.push([lo, hi])
+  return spans
+}
+
+/** 正压在已画线段上，而且附近没有更近的未画线 */
+function sampleOnTakenInk(
+  hits: Array<{ contourId: number; index: number; dist: number }>,
+  byId: Map<number, Contour>,
+  masks: Map<number, Uint8Array>,
+): boolean {
+  let blocked = Number.POSITIVE_INFINITY
+  let free = Number.POSITIVE_INFINITY
+  for (const hit of hits) {
+    const contour = byId.get(hit.contourId)
+    if (!contour) continue
+    if (indexTaken(masks.get(hit.contourId), hit.index, contour.points.length)) {
+      blocked = Math.min(blocked, hit.dist)
+    } else {
+      free = Math.min(free, hit.dist)
+    }
+  }
+  return blocked + 1 < free
+}
+
+function emitMatches(
+  contour: Contour,
+  raw: Point[],
+  built: Built,
+  mask: Uint8Array | undefined,
+): StrokeMatch[] | null {
+  const indices = walkContourIndices(contour, built.startU, built.endU)
+  if (indices.length < 2) return null
+  const hasTaken = !!mask && indices.some((i) => mask[i] === 1)
+  if (!hasTaken) {
+    const source = raw.map((p) => ({ ...p }))
+    const target = orientPolyline(source, built.target)
+    if (target.length < 2 || arcLength(target) < 8) return null
+    const spans = compressSpans(indices)
+    if (spans.length === 0) return null
+    return [{ source, target, contourId: contour.id, spans }]
+  }
+
+  const pieces: StrokeMatch[] = []
+  const denom = Math.max(1, indices.length - 1)
+  let run: number[] = []
+  let runStart = 0
+  const flush = (end: number) => {
+    if (run.length < 2) {
+      run = []
+      return
+    }
+    const f0 = runStart / denom
+    const f1 = end / denom
+    const source = slicePolylineByFraction(raw, f0, f1)
+    let target = dedupePoints(run.map((i) => ({ ...contour.points[i] })))
+    if (source.length < 2 || target.length < 2) {
+      run = []
+      return
+    }
+    target = orientPolyline(source, target)
+    if (arcLength(target) < 8) {
+      run = []
+      return
+    }
+    const spans = compressSpans(run)
+    if (spans.length > 0) pieces.push({ source, target, contourId: contour.id, spans })
+    run = []
+  }
+  for (let k = 0; k < indices.length; k++) {
+    if (mask![indices[k]]) {
+      if (run.length > 0) flush(k - 1)
+      continue
+    }
+    if (run.length === 0) runStart = k
+    run.push(indices[k])
+  }
+  if (run.length > 0) flush(indices.length - 1)
+  return pieces.length > 0 ? pieces : null
+}
+
 /**
  * 抬笔后只选一条参考轮廓。
  * 看整段形状和位置，不拿笔迹长度去卡目标长度。
  * 目标是这条轮廓上从起点投影走到终点投影的一段；笔伸出端点就收到轮廓为止。
+ * 已经画过的下标会跳过，同一段线不会再匹配一次。
  * 整笔再按弧长拉到这段上。周围没有够近的线才放弃。
  */
 export function matchFinishedStroke(
@@ -318,6 +482,7 @@ export function matchFinishedStroke(
   contours: Contour[],
   index: SpatialIndex,
   radius: number,
+  taken?: readonly TakenSpan[],
 ): StrokeMatch[] | null {
   if (raw.length < 2 || contours.length === 0 || radius < 1) return null
   if (arcLength(raw) < 6) return null
@@ -326,29 +491,35 @@ export function matchFinishedStroke(
   const samples = resampleCount(raw, SAMPLE_N)
   const byId = new Map(contours.map((c) => [c.id, c]))
   const hits = samples.map((p) => queryHits(p.x, p.y, searchR, contours, index))
+  const masks = buildTakenMasks(byId, taken)
 
   const votes = new Map<number, number>()
   for (const list of hits) {
+    if (masks.size > 0 && sampleOnTakenInk(list, byId, masks)) continue
     for (const hit of list) {
       if (hit.dist > searchR) continue
+      const contour = byId.get(hit.contourId)
+      if (!contour) continue
+      if (indexTaken(masks.get(hit.contourId), hit.index, contour.points.length)) continue
       votes.set(hit.contourId, (votes.get(hit.contourId) ?? 0) + (1 - hit.dist / searchR))
     }
   }
   const ranked = [...votes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
 
   let best: Built | null = null
+  let bestId = -1
   for (const [id, vote] of ranked) {
     if (vote < 1.2) continue
     const contour = byId.get(id)
     if (!contour) continue
-    const built = matchContour(contour, samples, hits, searchR)
+    const built = matchContour(contour, samples, hits, searchR, masks.get(id))
     if (!built) continue
-    if (!best || built.score > best.score) best = built
+    if (!best || built.score > best.score) {
+      best = built
+      bestId = id
+    }
   }
-  if (!best) return null
-
-  const source = raw.map((p) => ({ ...p }))
-  const target = orientPolyline(source, best.target)
-  if (target.length < 2 || arcLength(target) < 8) return null
-  return [{ source, target }]
+  const contour = bestId >= 0 ? byId.get(bestId) : undefined
+  if (!best || !contour) return null
+  return emitMatches(contour, raw, best, masks.get(contour.id))
 }
