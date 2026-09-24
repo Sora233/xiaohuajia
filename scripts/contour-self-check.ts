@@ -1,4 +1,4 @@
-import { buildSpatialIndex, traceContours } from '@/lib/contours'
+import { buildSpatialIndex, takeTraceTimings, traceContours } from '@/lib/contours'
 import { matchFinishedStroke } from '@/lib/match-stroke'
 import { arcLength } from '@/lib/polyline'
 
@@ -167,6 +167,38 @@ const h = 80
   for (let x = 10; x <= 80; x += 4) raw.push({ x, y: 60 })
   const matched = matchFinishedStroke(raw, contours, index, 20)
   assert(matched === null, '远离轮廓的笔不应匹配')
+}
+
+// 大量虚线：旧的全对全补缺会到秒级甚至卡住。这里必须很快，并且仍能接成长线。
+{
+  const W = 800
+  const H = 480
+  const img = blank(W, H)
+  for (let y = 8; y < H - 8; y += 14) {
+    for (let x = 4; x < W - 28; x += 26) hline(img, W, x, x + 19, y)
+  }
+  for (let x = 70; x < W - 8; x += 140) vline(img, W, x, 8, H - 10)
+  const t0 = performance.now()
+  const contours = traceContours(img, W, H)
+  const ms = performance.now() - t0
+  const timings = takeTraceTimings()
+  const longest = contours.reduce((m, c) => Math.max(m, arcLength(c.points)), 0)
+  console.log(
+    '压力耗时',
+    Math.round(ms),
+    '边',
+    timings?.edges,
+    '补缺',
+    timings?.bridge,
+    '轮廓',
+    contours.length,
+    '最长',
+    Math.round(longest),
+  )
+  assert((timings?.edges ?? 0) > 400, '压力图没有留下足够碎片，补缺没有被测到')
+  assert(ms < 500, `轮廓提取过慢：${ms.toFixed(0)}ms`)
+  assert((timings?.bridge ?? 999) < 200, `补缺过慢：${timings?.bridge}ms`)
+  assert(longest > 200, `压力图没有接出长线：${longest.toFixed(0)}`)
 }
 
 console.log('contour self-check ok')

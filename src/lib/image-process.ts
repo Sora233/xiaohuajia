@@ -1,12 +1,7 @@
-import {
-  buildSpatialIndex,
-  thinSkeleton,
-  traceContours,
-  type Contour,
-  type SpatialIndex,
-} from '@/lib/contours'
+import type { Contour, SpatialIndex } from '@/lib/contours'
+import type { ExtractionTimings } from '@/lib/extract'
 
-/** 工作画布最长边，兼顾细节与主线程性能 */
+/** 工作画布最长边。上传的大图先缩到这里，再提取轮廓。 */
 export const MAX_EDGE = 1280
 
 export type ProcessedImage = {
@@ -16,6 +11,15 @@ export type ProcessedImage = {
   color: HTMLCanvasElement
   contours: Contour[]
   index: SpatialIndex
+  timings: ExtractionTimings & { raster: number; worker: number }
+}
+
+/** 后一次提取取消了前一次 */
+export class ProcessingCancelled extends Error {
+  constructor() {
+    super('cancelled')
+    this.name = 'ProcessingCancelled'
+  }
 }
 
 function createCanvas(width: number, height: number): HTMLCanvasElement {
@@ -42,135 +46,150 @@ export function loadHtmlImage(src: string): Promise<HTMLImageElement> {
   })
 }
 
-/** 按最长边缩放，保持宽高比 */
-export function rasterizeImage(
+function fittedSize(srcW: number, srcH: number, maxSize: number) {
+  const scale = Math.min(1, maxSize / Math.max(srcW, srcH))
+  return {
+    width: Math.max(1, Math.round(srcW * scale)),
+    height: Math.max(1, Math.round(srcH * scale)),
+  }
+}
+
+/**
+ * 按最长边缩放。优先用 createImageBitmap，把解码和缩放让出主线程。
+ * 尺寸只看图片本身，不乘 devicePixelRatio。
+ */
+export async function rasterizeImage(
   img: HTMLImageElement,
   maxSize = MAX_EDGE,
-): HTMLCanvasElement {
+): Promise<HTMLCanvasElement> {
   const srcW = Math.max(1, img.naturalWidth || img.width)
   const srcH = Math.max(1, img.naturalHeight || img.height)
-  const scale = Math.min(1, maxSize / Math.max(srcW, srcH))
-  const width = Math.max(1, Math.round(srcW * scale))
-  const height = Math.max(1, Math.round(srcH * scale))
+  const { width, height } = fittedSize(srcW, srcH, maxSize)
   const canvas = createCanvas(width, height)
   const ctx = requireCtx(canvas)
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bitmap = await createImageBitmap(img, {
+        resizeWidth: width,
+        resizeHeight: height,
+        resizeQuality: 'high',
+      })
+      ctx.drawImage(bitmap, 0, 0, width, height)
+      bitmap.close()
+      return canvas
+    } catch {
+      // 个别浏览器不接受 resize 选项，退回同步绘制
+    }
+  }
   ctx.drawImage(img, 0, 0, width, height)
   return canvas
 }
 
-function gaussianBlur5(
-  src: Float32Array,
+type WorkerResponse = {
+  ok: boolean
+  contours?: Contour[]
+  index?: SpatialIndex
+  timings?: ExtractionTimings
+  error?: string
+}
+
+let activeWorker: Worker | null = null
+let activeReject: ((err: Error) => void) | null = null
+
+function spawnWorker(
+  buffer: ArrayBuffer,
   width: number,
   height: number,
-): Float32Array {
-  // 可分离 5-tap 近似高斯核
-  const kernel = [0.06136, 0.24477, 0.38774, 0.24477, 0.06136]
-  const tmp = new Float32Array(width * height)
-  const out = new Float32Array(width * height)
-
-  for (let y = 0; y < height; y++) {
-    const row = y * width
-    for (let x = 0; x < width; x++) {
-      let acc = 0
-      for (let k = -2; k <= 2; k++) {
-        const xx = Math.min(width - 1, Math.max(0, x + k))
-        acc += src[row + xx] * kernel[k + 2]
-      }
-      tmp[row + x] = acc
-    }
-  }
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let acc = 0
-      for (let k = -2; k <= 2; k++) {
-        const yy = Math.min(height - 1, Math.max(0, y + k))
-        acc += tmp[yy * width + x] * kernel[k + 2]
-      }
-      out[y * width + x] = acc
-    }
-  }
-  return out
-}
-
-/**
- * 提取二值线掩膜：照片用 Sobel 边，线稿再加上深色墨迹。
- * `detail`：0–100，越大保留越弱的边。
- */
-export function extractMask(
-  color: HTMLCanvasElement,
   detail: number,
-): Uint8Array {
-  const { width, height } = color
-  const ctx = requireCtx(color)
-  const { data } = ctx.getImageData(0, 0, width, height)
-  const n = width * height
-  const gray = new Float32Array(n)
+): Promise<{ contours: Contour[]; index: SpatialIndex; timings: ExtractionTimings }> {
+  activeWorker?.terminate()
+  activeReject?.(new ProcessingCancelled())
+  activeReject = null
 
-  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
-  }
+  // Vite 会按 base（GitHub Pages 的 /xiaohuajia/）改写这个 URL
+  const worker = new Worker(new URL('../workers/extract.worker.ts', import.meta.url), {
+    type: 'module',
+  })
+  activeWorker = worker
 
-  const blurred = gaussianBlur5(gray, width, height)
-  const mag = new Float32Array(n)
-  let maxMag = 1
-  let meanGray = 0
+  return new Promise((resolve, reject) => {
+    activeReject = reject
+    const timer = window.setTimeout(() => {
+      if (activeWorker === worker) {
+        worker.terminate()
+        activeWorker = null
+        activeReject = null
+      }
+      reject(new Error('处理超时'))
+    }, 20000)
 
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const i = y * width + x
-      const gx =
-        -blurred[i - width - 1] +
-        blurred[i - width + 1] -
-        2 * blurred[i - 1] +
-        2 * blurred[i + 1] -
-        blurred[i + width - 1] +
-        blurred[i + width + 1]
-      const gy =
-        -blurred[i - width - 1] -
-        2 * blurred[i - width] -
-        blurred[i - width + 1] +
-        blurred[i + width - 1] +
-        2 * blurred[i + width] +
-        blurred[i + width + 1]
-      const m = Math.hypot(gx, gy)
-      mag[i] = m
-      if (m > maxMag) maxMag = m
+    worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+      window.clearTimeout(timer)
+      if (activeWorker === worker) {
+        activeWorker = null
+        activeReject = null
+      }
+      worker.terminate()
+      const data = event.data
+      if (!data.ok || !data.contours || !data.index || !data.timings) {
+        reject(new Error(data.error || '轮廓提取失败'))
+        return
+      }
+      resolve({ contours: data.contours, index: data.index, timings: data.timings })
     }
-  }
-
-  for (let i = 0; i < n; i++) meanGray += blurred[i]
-  meanGray /= n
-
-  const looksLikeLineArt = meanGray > 150
-  const tNorm = Math.min(100, Math.max(0, detail)) / 100
-  const edgeT = maxMag * (0.4 - tNorm * 0.34)
-  const inkT = looksLikeLineArt ? 176 : 108 + (1 - tNorm) * 42
-
-  const mark = new Uint8Array(n)
-  for (let i = 0; i < n; i++) {
-    const edge = mag[i] >= edgeT
-    const ink = blurred[i] < inkT
-    // 线稿只用墨迹，避免 Sobel 把每条线描成双边再撕碎骨架
-    mark[i] = looksLikeLineArt ? (ink ? 1 : 0) : edge ? 1 : 0
-  }
-  return mark
+    worker.onerror = () => {
+      window.clearTimeout(timer)
+      if (activeWorker === worker) {
+        activeWorker = null
+        activeReject = null
+      }
+      reject(new Error('轮廓提取失败'))
+    }
+    worker.postMessage({ buffer, width, height, detail }, [buffer])
+  })
 }
 
+function logTimings(
+  width: number,
+  height: number,
+  raster: number,
+  workerMs: number,
+  timings: ExtractionTimings,
+) {
+  const detail = timings.traceDetail
+  const traceText = detail
+    ? `边${detail.edges} 路径${detail.paths} 轮廓${detail.contours} ` +
+      `去碎${detail.removeSmall} 方块${detail.collapse} 毛刺${detail.prune} ` +
+      `抽链${detail.atomic} 穿叉${detail.link} 补缺${detail.bridge} 平滑${detail.polish}`
+    : ''
+  console.info(
+    `[小画家] 处理 ${width}x${height} 合计${Math.round(raster + workerMs)}ms ` +
+      `栅格${Math.round(raster)} 掩膜${Math.round(timings.mask)} 细化${Math.round(timings.thin)} ` +
+      `描线${Math.round(timings.trace)} 索引${Math.round(timings.index)} ${traceText}`,
+  )
+}
+
+/** 缩放在页面里做，细化与描线放到 Worker，避免卡住界面。 */
 export async function processSource(
   img: HTMLImageElement,
   detail: number,
 ): Promise<ProcessedImage> {
-  const color = rasterizeImage(img)
-  const mask = extractMask(color, detail)
-  const skel = thinSkeleton(mask, color.width, color.height)
-  const contours = traceContours(skel, color.width, color.height)
-  const index = buildSpatialIndex(contours, color.width, color.height)
+  const t0 = performance.now()
+  const color = await rasterizeImage(img)
+  const raster = performance.now() - t0
+  const { width, height } = color
+  const pixels = requireCtx(color).getImageData(0, 0, width, height)
+  const copy = new Uint8ClampedArray(pixels.data)
+  const tWorker = performance.now()
+  const extracted = await spawnWorker(copy.buffer, width, height, detail)
+  const workerMs = performance.now() - tWorker
+  logTimings(width, height, raster, workerMs, extracted.timings)
   return {
-    width: color.width,
-    height: color.height,
+    width,
+    height,
     color,
-    contours,
-    index,
+    contours: extracted.contours,
+    index: extracted.index,
+    timings: { ...extracted.timings, raster, worker: workerMs },
   }
 }
