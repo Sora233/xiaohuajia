@@ -1,4 +1,15 @@
-export type Point = { x: number; y: number }
+import {
+  arcLength,
+  dedupePoints,
+  normalize,
+  resampleSpacing,
+  simplifyClosed,
+  simplifyOpen,
+  smoothPolyline,
+  type Point,
+} from '@/lib/polyline'
+
+export type { Point }
 
 export type Contour = {
   id: number
@@ -6,7 +17,7 @@ export type Contour = {
   closed: boolean
 }
 
-type Hit = { contourId: number; index: number; dist: number }
+export type NearestHit = { contourId: number; index: number; dist: number }
 
 const N8: ReadonlyArray<readonly [number, number]> = [
   [0, -1],
@@ -89,35 +100,6 @@ function neighborCount(
   return n
 }
 
-function nextUnused(
-  img: Uint8Array,
-  used: Uint8Array,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  prevX: number,
-  prevY: number,
-): [number, number] | null {
-  let best: [number, number] | null = null
-  let bestScore = -1e9
-  const vx = x - prevX
-  const vy = y - prevY
-  for (const [dx, dy] of N8) {
-    const nx = x + dx
-    const ny = y + dy
-    if (!at(img, nx, ny, width, height)) continue
-    const j = ny * width + nx
-    if (used[j]) continue
-    const score = vx * dx + vy * dy
-    if (score > bestScore) {
-      bestScore = score
-      best = [nx, ny]
-    }
-  }
-  return best
-}
-
 function removeSmallComponents(
   skel: Uint8Array,
   width: number,
@@ -153,6 +135,52 @@ function removeSmallComponents(
   }
 }
 
+/**
+ * 细化后常留下 2×2 小块，整段轮廓会变成密密麻麻的假分叉。
+ * 每块删掉邻居最多的那一像素，直到不再有实心小方块。
+ */
+function collapseSquares(skel: Uint8Array, width: number, height: number) {
+  let guard = 0
+  let changed = true
+  while (changed && guard++ < 12) {
+    changed = false
+    const kill: number[] = []
+    const seen = new Uint8Array(skel.length)
+    for (let y = 0; y < height - 1; y++) {
+      for (let x = 0; x < width - 1; x++) {
+        const a = y * width + x
+        const b = a + 1
+        const c = a + width
+        const d = c + 1
+        if (!skel[a] || !skel[b] || !skel[c] || !skel[d]) continue
+        const cands = [a, b, c, d]
+        let best = a
+        let bestN = -1
+        for (const i of cands) {
+          if (seen[i]) continue
+          const px = i % width
+          const py = (i - px) / width
+          const n = neighborCount(skel, px, py, width, height)
+          if (n > bestN) {
+            bestN = n
+            best = i
+          }
+        }
+        if (seen[best]) continue
+        seen[best] = 1
+        kill.push(best)
+      }
+    }
+    for (const i of kill) {
+      if (skel[i]) {
+        skel[i] = 0
+        changed = true
+      }
+    }
+  }
+}
+
+/** 删掉从端点伸向分叉、短于 maxSpur 的毛刺，避免抢方向 */
 function pruneSpurs(
   skel: Uint8Array,
   width: number,
@@ -161,7 +189,7 @@ function pruneSpurs(
 ) {
   let changed = true
   let guard = 0
-  while (changed && guard++ < 30) {
+  while (changed && guard++ < 40) {
     changed = false
     const ends: Array<[number, number]> = []
     for (let y = 1; y < height - 1; y++) {
@@ -211,139 +239,353 @@ function pruneSpurs(
   }
 }
 
-/** 把骨架追踪成折线；沿最直方向穿过分叉，闭环标为 closed */
+type Edge = { points: Point[] }
+
+function bondKey(x1: number, y1: number, x2: number, y2: number) {
+  if (x1 < x2 || (x1 === x2 && y1 <= y2)) return `${x1},${y1}|${x2},${y2}`
+  return `${x2},${y2}|${x1},${y1}`
+}
+
+/** 在分叉处断开，抽出端点/结点之间的原子链，环单独成链 */
+function traceAtomicEdges(
+  skel: Uint8Array,
+  width: number,
+  height: number,
+): { edges: Edge[]; loops: Point[][] } {
+  const degAt = (x: number, y: number) => neighborCount(skel, x, y, width, height)
+  const used = new Set<string>()
+  const edges: Edge[] = []
+  const loops: Point[][] = []
+
+  const walk = (sx: number, sy: number, nx: number, ny: number): Point[] => {
+    const pts: Point[] = [
+      { x: sx, y: sy },
+      { x: nx, y: ny },
+    ]
+    used.add(bondKey(sx, sy, nx, ny))
+    let px = sx
+    let py = sy
+    let cx = nx
+    let cy = ny
+    let guard = 0
+    const limit = width * height
+    while (degAt(cx, cy) === 2 && guard++ < limit) {
+      let nx2 = -1
+      let ny2 = -1
+      for (const [dx, dy] of N8) {
+        const qx = cx + dx
+        const qy = cy + dy
+        if (!at(skel, qx, qy, width, height)) continue
+        if (qx === px && qy === py) continue
+        nx2 = qx
+        ny2 = qy
+        break
+      }
+      if (nx2 < 0) break
+      if (used.has(bondKey(cx, cy, nx2, ny2))) break
+      used.add(bondKey(cx, cy, nx2, ny2))
+      pts.push({ x: nx2, y: ny2 })
+      px = cx
+      py = cy
+      cx = nx2
+      cy = ny2
+    }
+    return pts
+  }
+
+  const consider = (x: number, y: number) => {
+    for (const [dx, dy] of N8) {
+      const nx = x + dx
+      const ny = y + dy
+      if (!at(skel, nx, ny, width, height)) continue
+      if (used.has(bondKey(x, y, nx, ny))) continue
+      const pts = walk(x, y, nx, ny)
+      if (pts.length < 2) continue
+      const a = pts[0]
+      const b = pts[pts.length - 1]
+      if (a.x === b.x && a.y === b.y && pts.length > 3) loops.push(pts.slice(0, -1))
+      else edges.push({ points: pts })
+    }
+  }
+
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      if (!skel[y * width + x]) continue
+      if (degAt(x, y) === 2) continue
+      consider(x, y)
+    }
+  }
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      if (!skel[y * width + x]) continue
+      if (degAt(x, y) !== 2) continue
+      consider(x, y)
+    }
+  }
+  return { edges, loops }
+}
+
+function portTangent(pts: Point[], atStart: boolean): Point {
+  // 跳过紧贴结点的几像素，结点上的骨架会被分叉挤歪
+  const skip = Math.min(5, Math.max(0, Math.floor((pts.length - 1) / 4)))
+  const reach = Math.min(pts.length - 1, skip + 14)
+  if (reach <= 0) return { x: 1, y: 0 }
+  if (atStart) return normalize(pts[reach].x - pts[skip].x, pts[reach].y - pts[skip].y)
+  const i = pts.length - 1
+  return normalize(pts[i - reach].x - pts[i - skip].x, pts[i - reach].y - pts[i - skip].y)
+}
+
+type Port = { edge: number; atStart: boolean; tx: number; ty: number }
+
+/**
+ * 在每个结点上，把走向最一致的两条链配成一对（近似直线穿过）。
+ * 直角拐弯不会被接上，留给后续「一笔跨多段」去匹配。
+ */
+function linkThroughJunctions(edges: Edge[]): Array<{ points: Point[]; closed: boolean }> {
+  const groups = new Map<string, Port[]>()
+  const addPort = (edge: number, atStart: boolean) => {
+    const pts = edges[edge].points
+    const p = atStart ? pts[0] : pts[pts.length - 1]
+    const key = `${p.x},${p.y}`
+    const tan = portTangent(pts, atStart)
+    const list = groups.get(key) ?? []
+    list.push({ edge, atStart, tx: tan.x, ty: tan.y })
+    groups.set(key, list)
+  }
+  for (let i = 0; i < edges.length; i++) {
+    addPort(i, true)
+    addPort(i, false)
+  }
+
+  const partner = new Map<string, { edge: number; atStart: boolean }>()
+  const portKey = (edge: number, atStart: boolean) => `${edge}:${atStart ? 0 : 1}`
+
+  for (const ports of groups.values()) {
+    if (ports.length < 2) continue
+    const pairs: Array<{ i: number; j: number; score: number }> = []
+    for (let i = 0; i < ports.length; i++) {
+      for (let j = i + 1; j < ports.length; j++) {
+        // 两条向外切线越相反，转角越小。score = cos(转角)
+        const score = -(ports[i].tx * ports[j].tx + ports[i].ty * ports[j].ty)
+        pairs.push({ i, j, score })
+      }
+    }
+    pairs.sort((a, b) => b.score - a.score)
+    const taken = new Set<number>()
+    for (const pair of pairs) {
+      // 大约 62° 以内视为同一条平滑轮廓。直角仍保持断开。
+      if (pair.score < 0.47) break
+      if (taken.has(pair.i) || taken.has(pair.j)) continue
+      taken.add(pair.i)
+      taken.add(pair.j)
+      const a = ports[pair.i]
+      const b = ports[pair.j]
+      partner.set(portKey(a.edge, a.atStart), { edge: b.edge, atStart: b.atStart })
+      partner.set(portKey(b.edge, b.atStart), { edge: a.edge, atStart: a.atStart })
+    }
+  }
+
+  const visited = new Set<number>()
+  const paths: Array<{ points: Point[]; closed: boolean }> = []
+
+  const sequenceOf = (edge: number, enterAtStart: boolean) => {
+    const pts = edges[edge].points
+    return enterAtStart ? pts : [...pts].reverse()
+  }
+
+  for (let seed = 0; seed < edges.length; seed++) {
+    if (visited.has(seed)) continue
+    visited.add(seed)
+    const seq: Array<{ edge: number; enterAtStart: boolean }> = [
+      { edge: seed, enterAtStart: true },
+    ]
+
+    let guard = 0
+    while (guard++ < edges.length + 2) {
+      const first = seq[0]
+      const prev = partner.get(portKey(first.edge, first.enterAtStart))
+      if (!prev) break
+      if (prev.edge === seed || seq.some((s) => s.edge === prev.edge)) break
+      visited.add(prev.edge)
+      seq.unshift({ edge: prev.edge, enterAtStart: !prev.atStart })
+    }
+
+    let closed = false
+    guard = 0
+    while (guard++ < edges.length + 2) {
+      const last = seq[seq.length - 1]
+      const next = partner.get(portKey(last.edge, !last.enterAtStart))
+      if (!next) break
+      if (next.edge === seq[0].edge) {
+        closed = true
+        break
+      }
+      if (seq.some((s) => s.edge === next.edge)) break
+      visited.add(next.edge)
+      seq.push({ edge: next.edge, enterAtStart: next.atStart })
+    }
+
+    const points: Point[] = []
+    for (const item of seq) {
+      const pts = sequenceOf(item.edge, item.enterAtStart)
+      const start = points.length === 0 ? 0 : 1
+      for (let i = start; i < pts.length; i++) points.push(pts[i])
+    }
+    if (closed && points.length > 2) {
+      const a = points[0]
+      const b = points[points.length - 1]
+      if (Math.hypot(a.x - b.x, a.y - b.y) <= 1.2) points.pop()
+    }
+    if (points.length >= 2) paths.push({ points, closed })
+  }
+  return paths
+}
+
+function outwardTangent(pts: Point[], atStart: boolean): Point {
+  const skip = Math.min(4, Math.max(0, Math.floor((pts.length - 1) / 5)))
+  const reach = Math.min(pts.length - 1, skip + 12)
+  if (reach <= 0) return { x: 1, y: 0 }
+  if (atStart) return normalize(pts[skip].x - pts[reach].x, pts[skip].y - pts[reach].y)
+  const i = pts.length - 1
+  return normalize(pts[i - skip].x - pts[i - reach].x, pts[i - skip].y - pts[i - reach].y)
+}
+
+/**
+ * 把端点之间的小缺口接上：缺口方向要和两端切线一致，
+ * 避免把平行线或直角拐角硬焊在一起。
+ */
+function bridgeGaps(paths: Array<{ points: Point[]; closed: boolean }>) {
+  const GAP = 18
+  let guard = 0
+  while (guard++ < paths.length + 4) {
+    type End = {
+      pi: number
+      atStart: boolean
+      x: number
+      y: number
+      tx: number
+      ty: number
+    }
+    const ends: End[] = []
+    for (let i = 0; i < paths.length; i++) {
+      const p = paths[i]
+      if (!p || p.closed || p.points.length < 2) continue
+      const a = outwardTangent(p.points, true)
+      const b = outwardTangent(p.points, false)
+      ends.push({
+        pi: i,
+        atStart: true,
+        x: p.points[0].x,
+        y: p.points[0].y,
+        tx: a.x,
+        ty: a.y,
+      })
+      const last = p.points[p.points.length - 1]
+      ends.push({
+        pi: i,
+        atStart: false,
+        x: last.x,
+        y: last.y,
+        tx: b.x,
+        ty: b.y,
+      })
+    }
+
+    let best = -1e9
+    let bi = -1
+    let bj = -1
+    for (let i = 0; i < ends.length; i++) {
+      for (let j = i + 1; j < ends.length; j++) {
+        const A = ends[i]
+        const B = ends[j]
+        if (A.pi === B.pi && A.atStart === B.atStart) continue
+        const dx = B.x - A.x
+        const dy = B.y - A.y
+        const d = Math.hypot(dx, dy)
+        if (d > GAP || d < 0.6) continue
+        if (A.pi === B.pi) {
+          const len = arcLength(paths[A.pi].points)
+          if (d > Math.min(18, len * 0.4)) continue
+        }
+        const gx = dx / d
+        const gy = dy / d
+        const alignA = A.tx * gx + A.ty * gy
+        const alignB = B.tx * -gx + B.ty * -gy
+        let minAlign = 0.84
+        if (d <= 5) minAlign = 0.2
+        else if (d <= 9) minAlign = 0.55
+        else if (d <= 14) minAlign = 0.72
+        if (alignA < minAlign || alignB < minAlign) continue
+        const score = alignA + alignB - d / GAP
+        if (score > best) {
+          best = score
+          bi = i
+          bj = j
+        }
+      }
+    }
+    if (bi < 0) break
+
+    const A = ends[bi]
+    const B = ends[bj]
+    if (A.pi === B.pi) {
+      paths[A.pi].closed = true
+      continue
+    }
+
+    let aPts = paths[A.pi].points.slice()
+    if (A.atStart) aPts.reverse()
+    let bPts = paths[B.pi].points.slice()
+    if (!B.atStart) bPts.reverse()
+    const gap = Math.hypot(
+      aPts[aPts.length - 1].x - bPts[0].x,
+      aPts[aPts.length - 1].y - bPts[0].y,
+    )
+    const merged = aPts.concat(gap < 1.2 ? bPts.slice(1) : bPts)
+    const keep = Math.min(A.pi, B.pi)
+    const drop = Math.max(A.pi, B.pi)
+    paths[keep] = { points: merged, closed: false }
+    paths.splice(drop, 1)
+  }
+}
+
+function polishPath(points: Point[], closed: boolean): Point[] {
+  const simplified = closed ? simplifyClosed(points, 1.2) : simplifyOpen(points, 1.2)
+  if (simplified.length < 2) return dedupePoints(points)
+  const smooth = smoothPolyline(simplified, closed, 2)
+  const sampled = resampleSpacing(smooth, 2.25, closed)
+  return dedupePoints(sampled)
+}
+
+/**
+ * 骨架 → 长折线。
+ * 先按结点拆开，再沿最顺的方向穿过分叉，并补上小缺口，最后简化、平滑。
+ */
 export function traceContours(
   skel: Uint8Array,
   width: number,
   height: number,
 ): Contour[] {
-  removeSmallComponents(skel, width, height, 14)
-  pruneSpurs(skel, width, height, 10)
+  removeSmallComponents(skel, width, height, 12)
+  collapseSquares(skel, width, height)
+  // 只剪很短的骨架毛刺。再长一点的分叉留给「穿过分叉」去决定要不要接上
+  pruneSpurs(skel, width, height, 8)
 
-  const used = new Uint8Array(skel.length)
-  const endpoints: Array<[number, number]> = []
-
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const i = y * width + x
-      if (!skel[i]) continue
-      if (neighborCount(skel, x, y, width, height) <= 1) endpoints.push([x, y])
-    }
-  }
+  const { edges, loops } = traceAtomicEdges(skel, width, height)
+  const paths = linkThroughJunctions(edges)
+  for (const loop of loops) paths.push({ points: loop, closed: true })
+  bridgeGaps(paths)
 
   const contours: Contour[] = []
-  let id = 0
-
-  const walk = (sx: number, sy: number): Point[] => {
-    const path: Point[] = [{ x: sx, y: sy }]
-    used[sy * width + sx] = 1
-    let px = sx
-    let py = sy
-    let cur = nextUnused(skel, used, sx, sy, width, height, sx + 1, sy)
-    while (cur) {
-      const [nx, ny] = cur
-      path.push({ x: nx, y: ny })
-      used[ny * width + nx] = 1
-      const nxt = nextUnused(skel, used, nx, ny, width, height, px, py)
-      px = nx
-      py = ny
-      cur = nxt
-    }
-    return path
-  }
-
-  for (const [x, y] of endpoints) {
-    if (used[y * width + x]) continue
-    const pts = walk(x, y)
-    if (pts.length >= 2) {
-      contours.push({ id: id++, points: pts, closed: false })
-    }
-  }
-
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const i = y * width + x
-      if (!skel[i] || used[i]) continue
-      const pts = walk(x, y)
-      if (pts.length >= 3) {
-        const a = pts[0]
-        const b = pts[pts.length - 1]
-        const closed = Math.hypot(a.x - b.x, a.y - b.y) <= 2
-        contours.push({ id: id++, points: pts, closed })
-      }
-    }
-  }
-
-  const kept = contours.filter((c) => c.points.length >= 8)
-  return stitchContours(kept)
-}
-
-/** 把端点相接、走向接近的短折线接成长轮廓 */
-function stitchContours(input: Contour[]): Contour[] {
-  const contours = input.map((c, i) => ({
-    ...c,
-    id: i,
-    points: c.points.slice(),
-  }))
-  let changed = true
-  let guard = 0
-  while (changed && guard++ < 40) {
-    changed = false
-    for (let i = 0; i < contours.length; i++) {
-      const a = contours[i]
-      if (!a || a.closed) continue
-      const aEnd = a.points[a.points.length - 1]
-      const aTan = tangentAt(a.points, a.points.length - 1, -1)
-      let bestJ = -1
-      let bestFlip = false
-      let bestScore = 0.35
-      for (let j = 0; j < contours.length; j++) {
-        if (i === j) continue
-        const b = contours[j]
-        if (!b || b.closed) continue
-        const b0 = b.points[0]
-        const b1 = b.points[b.points.length - 1]
-        const d0 = Math.hypot(aEnd.x - b0.x, aEnd.y - b0.y)
-        const d1 = Math.hypot(aEnd.x - b1.x, aEnd.y - b1.y)
-        if (d0 <= 3.2) {
-          const bTan = tangentAt(b.points, 0, 1)
-          const score = aTan.x * bTan.x + aTan.y * bTan.y
-          if (score > bestScore) {
-            bestScore = score
-            bestJ = j
-            bestFlip = false
-          }
-        }
-        if (d1 <= 3.2) {
-          const bTan = tangentAt(b.points, b.points.length - 1, -1)
-          const score = aTan.x * -bTan.x + aTan.y * -bTan.y
-          if (score > bestScore) {
-            bestScore = score
-            bestJ = j
-            bestFlip = true
-          }
-        }
-      }
-      if (bestJ < 0) continue
-      const other = contours[bestJ]
-      const extra = bestFlip ? other.points.slice().reverse() : other.points
-      a.points.push(...extra.slice(1))
-      contours.splice(bestJ, 1)
-      changed = true
-      break
-    }
+  for (const path of paths) {
+    const len = arcLength(path.points)
+    const minLen = path.closed ? 18 : 12
+    if (len < minLen || path.points.length < 2) continue
+    const points = polishPath(path.points, path.closed)
+    if (points.length < 2 || arcLength(points) < minLen) continue
+    contours.push({ id: contours.length, points, closed: path.closed })
   }
   return contours
-    .filter((c) => c.points.length >= 10)
-    .map((c, i) => ({ ...c, id: i }))
-}
-
-function tangentAt(pts: Point[], i: number, dir: number) {
-  const j = Math.min(pts.length - 1, Math.max(0, i + dir * 3))
-  const dx = pts[j].x - pts[i].x
-  const dy = pts[j].y - pts[i].y
-  const len = Math.hypot(dx, dy) || 1
-  return { x: dx / len, y: dy / len }
 }
 
 export type SpatialIndex = {
@@ -361,10 +603,7 @@ export function buildSpatialIndex(
 ): SpatialIndex {
   const cols = Math.max(1, Math.ceil(width / cell))
   const rows = Math.max(1, Math.ceil(height / cell))
-  const buckets: SpatialIndex['buckets'] = Array.from(
-    { length: cols * rows },
-    () => [],
-  )
+  const buckets: SpatialIndex['buckets'] = Array.from({ length: cols * rows }, () => [])
   for (const c of contours) {
     for (let i = 0; i < c.points.length; i++) {
       const p = c.points[i]
@@ -376,19 +615,20 @@ export function buildSpatialIndex(
   return { cell, cols, rows, buckets }
 }
 
-function queryHits(
+/** 半径内每条轮廓只保留最近点 */
+export function queryHits(
   x: number,
   y: number,
   radius: number,
   contours: Contour[],
   index: SpatialIndex,
-): Hit[] {
+): NearestHit[] {
   const r = radius
   const minX = Math.max(0, Math.floor((x - r) / index.cell))
   const maxX = Math.min(index.cols - 1, Math.floor((x + r) / index.cell))
   const minY = Math.max(0, Math.floor((y - r) / index.cell))
   const maxY = Math.min(index.rows - 1, Math.floor((y + r) / index.cell))
-  const best = new Map<number, Hit>()
+  const best = new Map<number, NearestHit>()
   const byId = new Map(contours.map((c) => [c.id, c]))
   const r2 = r * r
   for (let cy = minY; cy <= maxY; cy++) {
@@ -413,211 +653,54 @@ function queryHits(
   return [...best.values()]
 }
 
-function nearestOnContour(
-  x: number,
-  y: number,
-  contour: Contour,
-  radius: number,
-  hint = -1,
-): Hit | null {
+export function contourTangent(contour: Contour, index: number): Point {
   const pts = contour.points
-  let lo = 0
-  let hi = pts.length - 1
-  if (hint >= 0) {
-    const win = 48
-    lo = Math.max(0, hint - win)
-    hi = Math.min(pts.length - 1, hint + win)
-  }
-  let bestI = -1
-  let bestD = radius + 1
-  for (let i = lo; i <= hi; i++) {
-    const p = pts[i]
-    const d = Math.hypot(p.x - x, p.y - y)
-    if (d < bestD) {
-      bestD = d
-      bestI = i
-    }
-  }
-  if (bestI < 0 || bestD > radius) {
-    if (hint >= 0) return nearestOnContour(x, y, contour, radius, -1)
-    return null
-  }
-  return { contourId: contour.id, index: bestI, dist: bestD }
+  const n = pts.length
+  if (n < 2) return { x: 1, y: 0 }
+  const i = ((index % n) + n) % n
+  const i0 = contour.closed ? (i - 3 + n) % n : Math.max(0, i - 3)
+  const i1 = contour.closed ? (i + 3) % n : Math.min(n - 1, i + 3)
+  return normalize(pts[i1].x - pts[i0].x, pts[i1].y - pts[i0].y)
 }
 
-function unwrapDelta(d: number, n: number, closed: boolean) {
-  if (!closed) return d
-  if (d > n / 2) return d - n
-  if (d < -n / 2) return d + n
-  return d
+function mod(i: number, n: number) {
+  return ((i % n) + n) % n
 }
 
-function extractSubpath(
-  contour: Contour,
-  startIdx: number,
-  endIdx: number,
-  signedTravel: number,
-): Point[] {
+/** 沿轮廓从起点下标走到终点下标（下标可以是展开后的实数） */
+export function sliceContour(contour: Contour, startU: number, endU: number): Point[] {
   const pts = contour.points
   const n = pts.length
   if (n === 0) return []
-  if (Math.abs(signedTravel) < 1 && Math.abs(endIdx - startIdx) < 1) {
-    const i0 = Math.max(0, startIdx - 3)
-    const i1 = Math.min(n - 1, startIdx + 3)
-    return pts.slice(i0, i1 + 1)
-  }
-  const dir = signedTravel >= 0 ? 1 : -1
+  if (n === 1) return [{ ...pts[0] }]
+  const span = endU - startU
+  const dir = span >= 0 ? 1 : -1
+  const steps = Math.min(n, Math.max(0, Math.round(Math.abs(span))))
   const out: Point[] = []
-  let i = startIdx
-  const limit = Math.min(n * 2, Math.max(2, Math.round(Math.abs(signedTravel)) + 2))
-  for (let step = 0; step <= limit; step++) {
-    out.push(pts[((i % n) + n) % n])
-    if (step > 0 && ((i % n) + n) % n === endIdx) break
+  let i = mod(Math.round(startU), n)
+  for (let s = 0; s <= steps; s++) {
+    out.push(pts[i])
     if (!contour.closed && (i + dir < 0 || i + dir >= n)) break
-    i += dir
+    i = mod(i + dir, n)
+    if (contour.closed && s > 0 && steps >= n && i === mod(Math.round(startU), n)) break
   }
-  return out
+  return dedupePoints(out, 0.2)
 }
 
-export type SnapResult = {
-  points: Point[]
-  contourId: number
-}
-
-/**
- * 把一串输入点吸附到最近轮廓的一段：取首末投影，
- * 按用户行进方向沿轮廓取样，空白处（超半径）不贡献。
- */
-export function snapPointsToContour(
-  raw: Point[],
-  contours: Contour[],
-  index: SpatialIndex,
-  radius: number,
-  preferId = -1,
-): SnapResult | null {
-  if (raw.length === 0 || contours.length === 0) return null
-
-  const byId = new Map(contours.map((c) => [c.id, c]))
-  const votes = new Map<number, { hits: number; dist: number }>()
-
-  for (const p of raw) {
-    const hits = queryHits(p.x, p.y, radius, contours, index)
-    for (const h of hits) {
-      const v = votes.get(h.contourId) ?? { hits: 0, dist: 0 }
-      v.hits++
-      v.dist += h.dist
-      votes.set(h.contourId, v)
-    }
+/** 下标走到轮廓任一端点的弧长，闭合轮廓没有端点 */
+export function distanceToOpenEnd(contour: Contour, index: number) {
+  if (contour.closed) return Number.POSITIVE_INFINITY
+  const pts = contour.points
+  const i = Math.max(0, Math.min(pts.length - 1, Math.round(index)))
+  let d0 = 0
+  for (let k = i; k > 0; k--) {
+    d0 += Math.hypot(pts[k].x - pts[k - 1].x, pts[k].y - pts[k - 1].y)
+    if (d0 > 48) break
   }
-
-  const preferVotes = votes.get(preferId)
-  let chosen = -1
-  if (preferVotes && preferVotes.hits >= raw.length * 0.34) {
-    chosen = preferId
-  } else {
-    let bestScore = -1e9
-    for (const [cid, v] of votes) {
-      const len = byId.get(cid)?.points.length ?? 0
-      const score =
-        v.hits * 3 +
-        len * 0.04 -
-        v.dist / Math.max(1, v.hits) / Math.max(1, radius)
-      if (score > bestScore) {
-        bestScore = score
-        chosen = cid
-      }
-    }
+  let d1 = 0
+  for (let k = i; k < pts.length - 1; k++) {
+    d1 += Math.hypot(pts[k].x - pts[k + 1].x, pts[k].y - pts[k + 1].y)
+    if (d1 > 48) break
   }
-
-  const contour = byId.get(chosen)
-  if (!contour) return null
-
-  const hitRate = (votes.get(chosen)?.hits ?? 0) / raw.length
-  if (raw.length > 4 && hitRate < 0.18) return null
-
-  const projections: number[] = []
-  let hint = -1
-  for (const p of raw) {
-    const h = nearestOnContour(p.x, p.y, contour, radius, hint)
-    if (!h) continue
-    projections.push(h.index)
-    hint = h.index
-  }
-  if (projections.length === 0) return null
-
-  const n = contour.points.length
-  let signed = 0
-  for (let i = 1; i < projections.length; i++) {
-    signed += unwrapDelta(projections[i] - projections[i - 1], n, contour.closed)
-  }
-  if (Math.abs(signed) < 1) {
-    signed = unwrapDelta(
-      projections[projections.length - 1] - projections[0],
-      n,
-      contour.closed,
-    )
-  }
-
-  const points = extractSubpath(
-    contour,
-    projections[0],
-    projections[projections.length - 1],
-    signed,
-  )
-  if (points.length < 2) return null
-  return { points, contourId: contour.id }
-}
-
-export class SnapSession {
-  raw: Point[] = []
-  private preferId = -1
-  private contours: Contour[]
-  private index: SpatialIndex
-  private radius: number
-
-  constructor(contours: Contour[], index: SpatialIndex, radius: number) {
-    this.contours = contours
-    this.index = index
-    this.radius = radius
-  }
-
-  add(x: number, y: number) {
-    const last = this.raw[this.raw.length - 1]
-    if (last && Math.hypot(last.x - x, last.y - y) < 0.8) return
-    this.raw.push({ x, y })
-    if (this.preferId < 0 && this.raw.length >= 5) {
-      const r = snapPointsToContour(
-        this.raw,
-        this.contours,
-        this.index,
-        this.radius,
-        -1,
-      )
-      if (r) this.preferId = r.contourId
-    }
-  }
-
-  live(): Point[] | null {
-    const r = snapPointsToContour(
-      this.raw,
-      this.contours,
-      this.index,
-      this.radius,
-      this.preferId,
-    )
-    if (r) this.preferId = r.contourId
-    return r?.points ?? null
-  }
-
-  finalize(): Point[] | null {
-    return (
-      snapPointsToContour(
-        this.raw,
-        this.contours,
-        this.index,
-        this.radius,
-        this.preferId,
-      )?.points ?? null
-    )
-  }
+  return Math.min(d0, d1)
 }

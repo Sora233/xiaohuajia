@@ -33,6 +33,7 @@ function Button({
   variant,
   size,
   asChild = false,
+  type = 'button',
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> &
   VariantProps<typeof buttonVariants> & { asChild?: boolean }) {
@@ -40,6 +41,7 @@ function Button({
   return (
     <Comp
       data-slot="button"
+      type={asChild ? undefined : type}
       className={cn(buttonVariants({ variant, size, className }))}
       {...props}
     />
