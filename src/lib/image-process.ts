@@ -67,6 +67,9 @@ export async function rasterizeImage(
   const { width, height } = fittedSize(srcW, srcH, maxSize)
   const canvas = createCanvas(width, height)
   const ctx = requireCtx(canvas)
+  // 透明底按白纸处理。线稿 PNG 的留白经常是透明像素，不铺底会被读成黑块
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, width, height)
   if (typeof createImageBitmap === 'function') {
     try {
       const bitmap = await createImageBitmap(img, {

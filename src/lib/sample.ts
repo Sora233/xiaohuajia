@@ -1,5 +1,4 @@
-import sampleSvg from '@/assets/sample-reference.svg?raw'
+import tvheadUrl from '@/assets/tvhead-reference.png'
 
-/** 内联示例图，file:// 单文件构建也能用，不必再请求外部资源 */
-export const SAMPLE_IMAGE_SRC =
-  'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(sampleSvg)
+/** 打包进产物的示例图。Pages 走 base 路径，单文件构建会嵌进 HTML */
+export const SAMPLE_IMAGE_SRC = tvheadUrl

@@ -111,15 +111,23 @@ export function dedupePoints(pts: Point[], minDist = 0.35): Point[] {
   return out
 }
 
-/** 让目标折线的走向跟源折线一致（必要时整段反向） */
+/**
+ * 让目标折线的走向跟源折线一致（必要时整段反向）。
+ * 主要看中间一段：笔迹两端伸出轮廓时，端点对不齐，不能据此把线翻过来。
+ */
 export function orientPolyline(src: Point[], dst: Point[]): Point[] {
   if (dst.length < 2 || src.length < 2) return dst.map((p) => ({ ...p }))
-  const s0 = src[0]
-  const s1 = src[src.length - 1]
-  const d0 = dst[0]
-  const d1 = dst[dst.length - 1]
-  const forward = dist(s0, d0) + dist(s1, d1)
-  const backward = dist(s0, d1) + dist(s1, d0)
+  const n = 8
+  const s = resampleCount(src, n)
+  const d = resampleCount(dst, n)
+  let forward = 0
+  let backward = 0
+  for (let i = 2; i <= n - 3; i++) {
+    forward += dist(s[i], d[i])
+    backward += dist(s[i], d[n - 1 - i])
+  }
+  forward += 0.35 * (dist(s[0], d[0]) + dist(s[n - 1], d[n - 1]))
+  backward += 0.35 * (dist(s[0], d[n - 1]) + dist(s[n - 1], d[0]))
   const ordered = backward + 0.75 < forward ? [...dst].reverse() : dst
   return ordered.map((p) => ({ ...p }))
 }

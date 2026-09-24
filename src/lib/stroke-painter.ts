@@ -293,6 +293,19 @@ export class StrokePainter {
     }
   }
 
+  /** 抬笔后短暂标出将对上的那条参考线 */
+  private paintTargetHint(ctx: CanvasRenderingContext2D, pts: Point[], width: number) {
+    if (pts.length < 2) return
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+    ctx.strokeStyle = 'rgba(181, 68, 42, 0.36)'
+    ctx.lineWidth = width + 4.5
+    ctx.beginPath()
+    ctx.moveTo(pts[0].x, pts[0].y)
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
+    ctx.stroke()
+  }
+
   private paintRaw(ctx: CanvasRenderingContext2D, pts: Point[]) {
     if (pts.length < 2) return
     ctx.lineCap = 'round'
@@ -334,6 +347,9 @@ export class StrokePainter {
       if (s.opacity <= 0.01 || s.display.length === 0) continue
       ctx.save()
       ctx.globalAlpha = s.opacity
+      if (s.phase === 'hold' || s.phase === 'morph') {
+        for (const piece of s.pieces) this.paintTargetHint(ctx, piece.target, s.width)
+      }
       for (const pts of s.display) this.paintStroke(ctx, pts, s.width, this.colorMode)
       ctx.restore()
     }
