@@ -1,4 +1,5 @@
 import { buildSpatialIndex, takeTraceTimings, traceContours } from '@/lib/contours'
+import { runExtraction } from '@/lib/extract'
 import { matchFinishedStroke } from '@/lib/match-stroke'
 import { arcLength, resampleSpacing } from '@/lib/polyline'
 
@@ -163,6 +164,39 @@ const h = 80
   assert(matched === null, '远离轮廓的笔不应匹配')
 }
 
+// 偏出几十像素、两端伸出轮廓：长度不必一样，整笔仍应吸上这一条
+{
+  const img = blank(w, h)
+  hline(img, w, 24, 96, 18)
+  const contours = traceContours(img, w, h)
+  const index = buildSpatialIndex(contours, w, h)
+  const raw = []
+  for (let x = -20; x <= 150; x += 4) {
+    raw.push({ x, y: 18 + 42 + Math.sin(x / 5) * 7 })
+  }
+  const matched = matchFinishedStroke(raw, contours, index, 36)
+  assert(matched && matched.length === 1, '偏移加伸出的长笔应匹配到一条')
+  const targetLen = arcLength(matched[0].target)
+  const sourceLen = arcLength(matched[0].source)
+  console.log('偏移伸出', '目标', Math.round(targetLen), '源', Math.round(sourceLen))
+  assert(targetLen > 60, `偏移伸出的目标太短：${targetLen.toFixed(1)}`)
+  assert(Math.abs(sourceLen - arcLength(raw)) < 1, '源应保留整笔，不能按长度裁掉')
+}
+
+// 默认容差下大约 48px 的平行偏移要吸上；半径 20 时同样的距离应淡出
+{
+  const img = blank(w, h)
+  hline(img, w, 8, 100, 16)
+  const contours = traceContours(img, w, h)
+  const index = buildSpatialIndex(contours, w, h)
+  const raw = []
+  for (let x = 8; x <= 100; x += 4) raw.push({ x, y: 16 + 48 })
+  const near = matchFinishedStroke(raw, contours, index, 36)
+  const far = matchFinishedStroke(raw, contours, index, 20)
+  assert(near && near.length === 1 && arcLength(near[0].target) > 70, '48px 偏移在默认容差下应吸上')
+  assert(far === null, '半径 20 时 48px 以上的偏移应淡出')
+}
+
 // 大量虚线：旧的全对全补缺会到秒级甚至卡住。这里必须很快，并且仍能接成长线。
 {
   const W = 800
@@ -301,6 +335,124 @@ function wobble(pts: { x: number; y: number }[], amp = 6) {
   assert(contours.length === 1, `共线虚线没有接成一条，实际 ${contours.length}`)
   assert(cover >= 0.85, `虚线长笔覆盖不够：${cover.toFixed(2)}`)
   assert(outLen > dashLen * 0.85, `虚线长笔的输出比描过的线段短太多：${outLen.toFixed(0)}`)
+}
+
+function paper(width: number, height: number) {
+  const data = new Uint8ClampedArray(width * height * 4)
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = 255
+    data[i + 1] = 255
+    data[i + 2] = 255
+    data[i + 3] = 255
+  }
+  return data
+}
+
+function inkAt(data: Uint8ClampedArray, width: number, x: number, y: number) {
+  const i = (y * width + x) * 4
+  data[i] = 0
+  data[i + 1] = 0
+  data[i + 2] = 0
+}
+
+function lengthsOf(contours: Array<{ points: { x: number; y: number }[] }>) {
+  return contours.map((c) => arcLength(c.points)).sort((a, b) => b - a)
+}
+
+// 粗线应收成一条中心线，而不是并排的两条边
+{
+  const W = 160
+  const H = 80
+  const data = paper(W, H)
+  for (let x = 12; x <= 140; x++) {
+    for (let t = 0; t < 4; t++) inkAt(data, W, x, 36 + t)
+  }
+  const { contours } = runExtraction(data, W, H, 62)
+  const lens = lengthsOf(contours)
+  console.log('粗线中心', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','))
+  assert(contours.length <= 2, `4px 粗线裂成了太多条：${contours.length}`)
+  assert(lens[0] > 90 && lens[0] < 180, `4px 粗线没有收到中心线：${lens[0]?.toFixed(0)}`)
+}
+
+// 实心块取外边界，不抽成一根短脊
+{
+  const W = 100
+  const H = 80
+  const data = paper(W, H)
+  for (let y = 16; y < 56; y++) {
+    for (let x = 20; x < 70; x++) inkAt(data, W, x, y)
+  }
+  const { contours } = runExtraction(data, W, H, 62)
+  const lens = lengthsOf(contours)
+  const total = lens.reduce((s, n) => s + n, 0)
+  console.log('实心块', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','))
+  assert(contours.length <= 3, `实心块轮廓太多：${contours.length}`)
+  assert(lens[0] > 140 && lens[0] < 240, `实心块边界长度不对：${lens[0]?.toFixed(0)}`)
+  assert(total < 420, `实心块骨架太碎：${total.toFixed(0)}`)
+}
+
+// 成片网点只留一块外轮廓
+{
+  const W = 130
+  const H = 100
+  const data = paper(W, H)
+  for (let y = 14; y <= 78; y += 6) {
+    for (let x = 16; x <= 108; x += 6) {
+      inkAt(data, W, x, y)
+      inkAt(data, W, x + 1, y)
+      inkAt(data, W, x, y + 1)
+      inkAt(data, W, x + 1, y + 1)
+    }
+  }
+  const { contours } = runExtraction(data, W, H, 62)
+  const lens = lengthsOf(contours)
+  console.log('网点', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','))
+  assert(contours.length <= 3, `网点被拆成很多条：${contours.length}`)
+  assert(lens[0] > 160, `网点没有留下外轮廓：${lens[0]?.toFixed(0)}`)
+}
+
+// 3px 粗线中间断开约 24px，两边都够长时应接成一条
+{
+  const W = 180
+  const H = 70
+  const data = paper(W, H)
+  for (let x = 8; x <= 70; x++) {
+    for (let t = 0; t < 3; t++) inkAt(data, W, x, 30 + t)
+  }
+  for (let x = 95; x <= 168; x++) {
+    for (let t = 0; t < 3; t++) inkAt(data, W, x, 30 + t)
+  }
+  const { contours } = runExtraction(data, W, H, 62)
+  const main = contours.slice().sort((a, b) => arcLength(b.points) - arcLength(a.points))[0]
+  const xs = main ? [main.points[0].x, main.points[main.points.length - 1].x] : [0, 0]
+  console.log(
+    '宽缺口',
+    '条数',
+    contours.length,
+    '长度',
+    lengthsOf(contours).map((n) => Math.round(n)).join(','),
+    '端点',
+    xs.map((n) => Math.round(n)).join(','),
+  )
+  assert(main && Math.min(...xs) < 16 && Math.max(...xs) > 155, '24px 共线缺口没有接上')
+}
+
+// 相距 16px 的平行线保持两条，不能被闭运算或补缺焊在一起
+{
+  const W = 180
+  const H = 70
+  const data = paper(W, H)
+  for (let x = 10; x <= 160; x++) {
+    for (let t = 0; t < 3; t++) {
+      inkAt(data, W, x, 18 + t)
+      inkAt(data, W, x, 34 + t)
+    }
+  }
+  const { contours } = runExtraction(data, W, H, 62)
+  const lens = lengthsOf(contours)
+  console.log('平行线', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','))
+  const longs = lens.filter((n) => n > 80)
+  assert(longs.length >= 2, `16px 平行线被并成了一条：${lens.map((n) => Math.round(n)).join(',')}`)
 }
 
 console.log('contour self-check ok')

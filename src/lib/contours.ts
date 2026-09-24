@@ -486,15 +486,18 @@ type GapEnd = {
  * 稍远的缺口允许拐角；再远只接几乎共线的，避免把内外框或平行线焊在一起。
  * 掉头（大约超过 105°）不接。
  */
-function gapScore(paths: Array<{ points: Point[]; closed: boolean }>, A: GapEnd, B: GapEnd) {
+function gapScore(A: GapEnd, B: GapEnd, lens: Float64Array) {
   if (A.pi === B.pi && A.atStart === B.atStart) return null
   const dx = B.x - A.x
   const dy = B.y - A.y
   const d = Math.hypot(dx, dy)
-  if (d > 32 || d < 0.6) return null
+  const lenA = lens[A.pi]
+  const lenB = lens[B.pi]
+  // 至少保持原来的 32px；两边都长、又几乎共线时，笔尖抬起的缺口可以放到大约 64px
+  const reach = Math.min(64, Math.max(32, 28 + Math.min(lenA, lenB) / 28))
+  if (d > reach || d < 0.6) return null
   if (A.pi === B.pi) {
-    const len = arcLength(paths[A.pi].points)
-    if (d > Math.min(24, len * 0.45)) return null
+    if (d > Math.min(24, lenA * 0.45)) return null
   }
   const gx = dx / d
   const gy = dy / d
@@ -523,6 +526,11 @@ function bridgeGaps(paths: Array<{ points: Point[]; closed: boolean }>) {
   const NEIGHBOR_CAP = 96
 
   for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const lens = new Float64Array(paths.length)
+    for (let i = 0; i < paths.length; i++) {
+      const path = paths[i]
+      lens[i] = path && path.points.length >= 2 ? arcLength(path.points) : 0
+    }
     const ends: GapEnd[] = []
     for (let i = 0; i < paths.length; i++) {
       const p = paths[i]
@@ -563,8 +571,10 @@ function bridgeGaps(paths: Array<{ points: Point[]; closed: boolean }>) {
       const cx = Math.floor(A.x / CELL)
       const cy = Math.floor(A.y / CELL)
       const nearby: number[] = []
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
+      // 短线的缺口落在一格里；只有长线才往两格外找，避免压力图变成全对全
+      const rad = lens[A.pi] > 112 ? 2 : 1
+      for (let oy = -rad; oy <= rad; oy++) {
+        for (let ox = -rad; ox <= rad; ox++) {
           const list = buckets.get(`${cx + ox},${cy + oy}`)
           if (!list) continue
           for (const j of list) if (j > i) nearby.push(j)
@@ -581,7 +591,7 @@ function bridgeGaps(paths: Array<{ points: Point[]; closed: boolean }>) {
         nearby.length = NEIGHBOR_CAP
       }
       for (const j of nearby) {
-        const score = gapScore(paths, A, ends[j])
+        const score = gapScore(A, ends[j], lens)
         if (score === null) continue
         cands.push({ i, j, score })
       }
@@ -960,7 +970,7 @@ export function traceContours(
   timings.collapse = lap(t)
   t = performance.now()
   // 只剪很短的骨架毛刺。再长一点的分叉留给「穿过分叉」去决定要不要接上
-  pruneSpurs(skel, width, height, 8)
+  pruneSpurs(skel, width, height, 12)
   timings.prune = lap(t)
 
   t = performance.now()
