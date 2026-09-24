@@ -204,6 +204,15 @@ export function simplifyClosed(pts: Point[], epsilon: number): Point[] {
   return open
 }
 
+/** 沿边只取近处的点，避免简化后的长边把拐角拉飞 */
+function pointAlong(from: Point, to: Point, maxDist: number): Point {
+  const dx = to.x - from.x
+  const dy = to.y - from.y
+  const l = Math.hypot(dx, dy)
+  if (l <= maxDist || l < 1e-6) return to
+  return { x: from.x + (dx / l) * maxDist, y: from.y + (dy / l) * maxDist }
+}
+
 /** 轻度平滑，尖角（折角大约超过 60°）保持不动 */
 export function smoothPolyline(pts: Point[], closed: boolean, passes = 2): Point[] {
   let cur = pts.map((p) => ({ ...p }))
@@ -217,9 +226,11 @@ export function smoothPolyline(pts: Point[], closed: boolean, passes = 2): Point
       const v1 = normalize(pt.x - prev.x, pt.y - prev.y)
       const v2 = normalize(nxt.x - pt.x, nxt.y - pt.y)
       if (v1.x * v2.x + v1.y * v2.y < 0.5) return { ...pt }
+      const a = pointAlong(pt, prev, 8)
+      const b = pointAlong(pt, nxt, 8)
       return {
-        x: prev.x * 0.22 + pt.x * 0.56 + nxt.x * 0.22,
-        y: prev.y * 0.22 + pt.y * 0.56 + nxt.y * 0.22,
+        x: a.x * 0.22 + pt.x * 0.56 + b.x * 0.22,
+        y: a.y * 0.22 + pt.y * 0.56 + b.y * 0.22,
       }
     })
     cur = next

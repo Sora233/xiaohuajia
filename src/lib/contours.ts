@@ -346,8 +346,9 @@ function portTangent(pts: Point[], atStart: boolean): Point {
 type Port = { edge: number; atStart: boolean; tx: number; ty: number }
 
 /**
- * 在每个结点上，把走向最一致的两条链配成一对（近似直线穿过）。
- * 直角拐弯不会被接上，留给后续「一笔跨多段」去匹配。
+ * 在每个结点上，把转角能接上的分支配成一对。
+ * 直线优先；直角拐弯也接上，这样窗框、桌沿会是一整条。
+ * 掉头（大约超过 105°）仍然断开，避免把毛刺焊进主线。
  */
 function linkThroughJunctions(edges: Edge[]): Array<{ points: Point[]; closed: boolean }> {
   const groups = new Map<string, Port[]>()
@@ -373,16 +374,20 @@ function linkThroughJunctions(edges: Edge[]): Array<{ points: Point[]; closed: b
     const pairs: Array<{ i: number; j: number; score: number }> = []
     for (let i = 0; i < ports.length; i++) {
       for (let j = i + 1; j < ports.length; j++) {
-        // 两条向外切线越相反，转角越小。score = cos(转角)
-        const score = -(ports[i].tx * ports[j].tx + ports[i].ty * ports[j].ty)
+        // 两条向外切线越相反，转角越小。turn = cos(转角)
+        const turn = -(ports[i].tx * ports[j].tx + ports[i].ty * ports[j].ty)
+        // 大约超过 105° 的掉头不接，避免毛刺焊进主线
+        if (turn < -0.25) continue
+        const lenA = edges[ports[i].edge].points.length
+        const lenB = edges[ports[j].edge].points.length
+        // 长边优先接在一起。短而更直的分叉让路，猫背、窗框才不会被腿或窗棱拆开
+        const score = turn * Math.sqrt(Math.min(lenA, lenB))
         pairs.push({ i, j, score })
       }
     }
     pairs.sort((a, b) => b.score - a.score)
     const taken = new Set<number>()
     for (const pair of pairs) {
-      // 大约 62° 以内视为同一条平滑轮廓。直角仍保持断开。
-      if (pair.score < 0.47) break
       if (taken.has(pair.i) || taken.has(pair.j)) continue
       taken.add(pair.i)
       taken.add(pair.j)
@@ -475,28 +480,36 @@ type GapEnd = {
   ty: number
 }
 
-/** 缺口方向是否和两端切线一致。平行线和直角不接。 */
+/**
+ * 端点之间能不能接成一条。
+ * 贴得很近的断口，共线或直角都接（窗框被骨架拆开时，两端常常背对背）。
+ * 稍远的缺口允许拐角；再远只接几乎共线的，避免把内外框或平行线焊在一起。
+ * 掉头（大约超过 105°）不接。
+ */
 function gapScore(paths: Array<{ points: Point[]; closed: boolean }>, A: GapEnd, B: GapEnd) {
-  const GAP = 18
   if (A.pi === B.pi && A.atStart === B.atStart) return null
   const dx = B.x - A.x
   const dy = B.y - A.y
   const d = Math.hypot(dx, dy)
-  if (d > GAP || d < 0.6) return null
+  if (d > 32 || d < 0.6) return null
   if (A.pi === B.pi) {
     const len = arcLength(paths[A.pi].points)
-    if (d > Math.min(18, len * 0.4)) return null
+    if (d > Math.min(24, len * 0.45)) return null
   }
   const gx = dx / d
   const gy = dy / d
   const alignA = A.tx * gx + A.ty * gy
   const alignB = B.tx * -gx + B.ty * -gy
-  let minAlign = 0.84
-  if (d <= 5) minAlign = 0.2
-  else if (d <= 9) minAlign = 0.55
-  else if (d <= 14) minAlign = 0.72
-  if (alignA < minAlign || alignB < minAlign) return null
-  return alignA + alignB - d / GAP
+  // 1 是直线，0 是直角，-1 是掉头
+  const turn = -(A.tx * B.tx + A.ty * B.ty)
+  if (turn < -0.25) return null
+  if (d > 18) {
+    if (turn < 0.9 || alignA < 0.88 || alignB < 0.88) return null
+  } else if (d > 4.5) {
+    // 直角缺口的方向大约是 0.7；明显落在背后的不接
+    if (alignA < 0.2 || alignB < 0.2) return null
+  }
+  return turn * 3 + alignA + alignB - d / 20
 }
 
 /**
@@ -505,7 +518,7 @@ function gapScore(paths: Array<{ points: Point[]; closed: boolean }>, A: GapEnd,
  * 轮数有硬上限，路径数只减不增，不会在主线程上做全对全扫描。
  */
 function bridgeGaps(paths: Array<{ points: Point[]; closed: boolean }>) {
-  const CELL = 18
+  const CELL = 32
   const MAX_PASSES = 16
   const NEIGHBOR_CAP = 96
 
@@ -623,6 +636,280 @@ function bridgeGaps(paths: Array<{ points: Point[]; closed: boolean }>) {
   }
 }
 
+/**
+ * 细化后偶发留下并排的两条骨架。较短、并且绝大部分点都贴着另一条的，丢掉。
+ * 只看彼此贴得很近的点，窗框的内外两圈（大约十几像素）不会被当成重影。
+ */
+function dropNearDuplicates(paths: Array<{ points: Point[]; closed: boolean }>) {
+  const CELL = 4
+  const NEAR = 2.6
+  const near2 = NEAR * NEAR
+  type Rec = { pi: number; x: number; y: number }
+  const buckets = new Map<string, Rec[]>()
+  const lens = new Array<number>(paths.length)
+  for (let pi = 0; pi < paths.length; pi++) {
+    const path = paths[pi]
+    lens[pi] = path.points.length < 2 ? 0 : arcLength(path.points)
+    if (path.closed || path.points.length < 2) continue
+    const step = Math.max(1, Math.floor(path.points.length / 64))
+    for (let i = 0; i < path.points.length; i += step) {
+      const pt = path.points[i]
+      const key = `${Math.floor(pt.x / CELL)},${Math.floor(pt.y / CELL)}`
+      const rec = { pi, x: pt.x, y: pt.y }
+      const list = buckets.get(key)
+      if (list) list.push(rec)
+      else buckets.set(key, [rec])
+    }
+  }
+
+  const drop = new Set<number>()
+  for (let pi = 0; pi < paths.length; pi++) {
+    const path = paths[pi]
+    if (path.closed || drop.has(pi) || path.points.length < 8) continue
+    const step = Math.max(1, Math.floor(path.points.length / 28))
+    const votes = new Map<number, number>()
+    let samples = 0
+    let near = 0
+    for (let i = 0; i < path.points.length; i += step) {
+      samples++
+      const pt = path.points[i]
+      const cx = Math.floor(pt.x / CELL)
+      const cy = Math.floor(pt.y / CELL)
+      let bestPi = -1
+      let bestD = near2
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const list = buckets.get(`${cx + ox},${cy + oy}`)
+          if (!list) continue
+          const limit = Math.min(list.length, 24)
+          for (let k = 0; k < limit; k++) {
+            const rec = list[k]
+            if (rec.pi === pi || drop.has(rec.pi)) continue
+            const d2 = (rec.x - pt.x) ** 2 + (rec.y - pt.y) ** 2
+            if (d2 < bestD) {
+              bestD = d2
+              bestPi = rec.pi
+            }
+          }
+        }
+      }
+      if (bestPi >= 0) {
+        near++
+        votes.set(bestPi, (votes.get(bestPi) ?? 0) + 1)
+      }
+    }
+    if (samples < 6 || near / samples < 0.72) continue
+    let winner = -1
+    let winnerN = 0
+    for (const [id, n] of votes) {
+      if (n > winnerN) {
+        winnerN = n
+        winner = id
+      }
+    }
+    if (winner < 0 || winnerN / samples < 0.6) continue
+    if (lens[pi] <= lens[winner]) drop.add(pi)
+    else drop.add(winner)
+  }
+  if (drop.size === 0) return
+  const next = []
+  for (let i = 0; i < paths.length; i++) if (!drop.has(i)) next.push(paths[i])
+  paths.length = 0
+  for (const path of next) paths.push(path)
+}
+
+function localTangent(pts: Point[], index: number): Point {
+  const i0 = Math.max(0, index - 4)
+  const i1 = Math.min(pts.length - 1, index + 4)
+  if (i1 === i0) return { x: 1, y: 0 }
+  return normalize(pts[i1].x - pts[i0].x, pts[i1].y - pts[i0].y)
+}
+
+/**
+ * 两条线有一段贴在一起、又各自多出一截时，把多出来的接上，合成一条更长的轮廓。
+ * 只接走向一致的重叠，窗棱搭在窗框上（方向垂直）不会被焊进去。
+ */
+function graftOverlaps(paths: Array<{ points: Point[]; closed: boolean }>) {
+  const CELL = 6
+  const NEAR = 6
+  const near2 = NEAR * NEAR
+  const MAX_PASSES = 8
+
+  const nearestOn = (
+    buckets: Map<string, Array<{ pi: number; i: number; x: number; y: number }>>,
+    pi: number,
+    x: number,
+    y: number,
+    hostFilter: number,
+  ) => {
+    const cx = Math.floor(x / CELL)
+    const cy = Math.floor(y / CELL)
+    let bestI = -1
+    let bestD = near2
+    let bestPi = -1
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const list = buckets.get(`${cx + ox},${cy + oy}`)
+        if (!list) continue
+        const n = Math.min(list.length, 28)
+        for (let k = 0; k < n; k++) {
+          const rec = list[k]
+          if (rec.pi === pi) continue
+          if (hostFilter >= 0 && rec.pi !== hostFilter) continue
+          const d2 = (rec.x - x) ** 2 + (rec.y - y) ** 2
+          if (d2 < bestD) {
+            bestD = d2
+            bestI = rec.i
+            bestPi = rec.pi
+          }
+        }
+      }
+    }
+    return bestPi < 0 ? null : { pi: bestPi, i: bestI }
+  }
+
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const buckets = new Map<string, Array<{ pi: number; i: number; x: number; y: number }>>()
+    for (let pi = 0; pi < paths.length; pi++) {
+      const path = paths[pi]
+      if (!path || path.closed || path.points.length < 2) continue
+      const step = path.points.length > 240 ? 2 : 1
+      for (let i = 0; i < path.points.length; i += step) {
+        const pt = path.points[i]
+        const key = `${Math.floor(pt.x / CELL)},${Math.floor(pt.y / CELL)}`
+        const rec = { pi, i, x: pt.x, y: pt.y }
+        const list = buckets.get(key)
+        if (list) list.push(rec)
+        else buckets.set(key, [rec])
+      }
+    }
+
+    const drop = new Set<number>()
+    const touched = new Set<number>()
+    let changed = false
+    for (let gi = 0; gi < paths.length; gi++) {
+      if (drop.has(gi)) continue
+      const guest = paths[gi]
+      if (!guest || guest.closed || guest.points.length < 10) continue
+
+      let best: {
+        host: number
+        overhang: number
+        atStart: boolean
+        split: number
+        hostIdx: number
+      } | null = null
+
+      for (const atStart of [true, false]) {
+        let host = -1
+        let overlap = 0
+        let split = atStart ? 0 : guest.points.length - 1
+        let hostIdx = -1
+        const limit = guest.points.length
+        for (let s = 0; s < limit; s++) {
+          const idx = atStart ? s : guest.points.length - 1 - s
+          const pt = guest.points[idx]
+          const hit = nearestOn(buckets, gi, pt.x, pt.y, host)
+          if (!hit) {
+            if (overlap >= 4) break
+            continue
+          }
+          if (host < 0) host = hit.pi
+          if (hit.pi !== host || drop.has(host)) {
+            if (overlap >= 4) break
+            continue
+          }
+          overlap++
+          split = idx
+          hostIdx = hit.i
+        }
+        if (host < 0 || overlap < 4 || drop.has(host) || touched.has(host)) continue
+        const overhang = atStart ? guest.points.length - 1 - split : split
+        if (overhang < 12) continue
+        if (!best || overhang > best.overhang) {
+          best = { host, overhang, atStart, split, hostIdx }
+        }
+      }
+      if (!best) continue
+
+      const hostPath = paths[best.host]
+      if (!hostPath || hostPath.closed || hostPath.points.length < 2 || touched.has(best.host)) continue
+      if (best.hostIdx < 0 || best.hostIdx >= hostPath.points.length) continue
+      if (best.split < 0 || best.split >= guest.points.length) continue
+      const gt = localTangent(guest.points, best.split)
+      const ht = localTangent(hostPath.points, best.hostIdx)
+      if (Math.abs(gt.x * ht.x + gt.y * ht.y) < 0.72) continue
+
+      const overhangPts = best.atStart
+        ? guest.points.slice(best.split)
+        : guest.points.slice(0, best.split + 1)
+      // 重叠落在宿主一端就直接接上；落在中间就把宿主切开，只把伸出的那段接到切点上
+      const dStart = Math.hypot(
+        hostPath.points[best.hostIdx].x - hostPath.points[0].x,
+        hostPath.points[best.hostIdx].y - hostPath.points[0].y,
+      )
+      const dEnd = Math.hypot(
+        hostPath.points[best.hostIdx].x - hostPath.points[hostPath.points.length - 1].x,
+        hostPath.points[best.hostIdx].y - hostPath.points[hostPath.points.length - 1].y,
+      )
+      const nearStart = best.hostIdx <= 8 || dStart < 16
+      const nearEnd = best.hostIdx >= hostPath.points.length - 9 || dEnd < 16
+      let hostAtEnd = dEnd <= dStart
+      if (nearStart && !nearEnd) hostAtEnd = false
+      if (nearEnd && !nearStart) hostAtEnd = true
+
+      const boundaryFirst = best.atStart
+      let extra = overhangPts.map((p) => ({ ...p }))
+      // 接到宿主末尾时，伸出段的接缝要放在开头；接到宿主开头时，接缝要放在末尾
+      if (hostAtEnd !== boundaryFirst) extra.reverse()
+      const hostPts = hostPath.points
+      let merged: Point[]
+      if (hostAtEnd) {
+        const gap = Math.hypot(
+          hostPts[hostPts.length - 1].x - extra[0].x,
+          hostPts[hostPts.length - 1].y - extra[0].y,
+        )
+        merged = hostPts.concat(gap < 1.2 ? extra.slice(1) : extra)
+      } else {
+        const gap = Math.hypot(extra[extra.length - 1].x - hostPts[0].x, extra[extra.length - 1].y - hostPts[0].y)
+        merged = (gap < 1.2 ? extra.slice(0, -1) : extra).concat(hostPts)
+      }
+      if (arcLength(merged) < arcLength(hostPts) + 10) continue
+      // 切在中间时，宿主没被接上的那一半若不是重影就留着
+      if (!nearStart && !nearEnd) {
+        const keepFrom = hostAtEnd ? 0 : best.hostIdx
+        const keepTo = hostAtEnd ? best.hostIdx : hostPts.length - 1
+        const rest = hostPts.slice(keepFrom, keepTo + 1).map((p) => ({ ...p }))
+        if (rest.length >= 8 && arcLength(rest) > 16) {
+          paths.push({ points: rest, closed: false })
+        }
+        const taken = hostAtEnd ? hostPts.slice(best.hostIdx) : hostPts.slice(0, best.hostIdx + 1)
+        if (hostAtEnd) {
+          const gap = Math.hypot(taken[taken.length - 1].x - extra[0].x, taken[taken.length - 1].y - extra[0].y)
+          merged = taken.concat(gap < 1.2 ? extra.slice(1) : extra)
+        } else {
+          const gap = Math.hypot(
+            extra[extra.length - 1].x - taken[0].x,
+            extra[extra.length - 1].y - taken[0].y,
+          )
+          merged = (gap < 1.2 ? extra.slice(0, -1) : extra).concat(taken)
+        }
+      }
+      paths[best.host] = { points: merged, closed: false }
+      drop.add(gi)
+      touched.add(best.host)
+      changed = true
+    }
+    if (!changed) break
+    if (drop.size > 0) {
+      const next = []
+      for (let i = 0; i < paths.length; i++) if (!drop.has(i)) next.push(paths[i])
+      paths.length = 0
+      for (const path of next) paths.push(path)
+    }
+  }
+}
+
 function polishPath(points: Point[], closed: boolean): Point[] {
   const simplified = closed ? simplifyClosed(points, 1.2) : simplifyOpen(points, 1.2)
   if (simplified.length < 2) return dedupePoints(points)
@@ -685,9 +972,11 @@ export function traceContours(
   const paths = linkThroughJunctions(edges)
   timings.link = lap(t)
   for (const loop of loops) paths.push({ points: loop, closed: true })
+  dropNearDuplicates(paths)
 
   t = performance.now()
   bridgeGaps(paths)
+  graftOverlaps(paths)
   timings.bridge = lap(t)
   timings.paths = paths.length
 
