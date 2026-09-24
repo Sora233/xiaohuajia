@@ -1,0 +1,11 @@
+{
+  "name": "xiaohuajia-simulator",
+  "install": "npm ci",
+  "terminals": [
+    {
+      "name": "dev",
+      "command": "npm run dev"
+    }
+  ],
+  "ports": [45217]
+}
