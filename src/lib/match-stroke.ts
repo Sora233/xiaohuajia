@@ -1,11 +1,8 @@
-import {
-  queryHits,
-  sliceContour,
-  type Contour,
-  type SpatialIndex,
-} from '@/lib/contours'
+import { queryHits, sliceContour, type Contour, type SpatialIndex } from '@/lib/contours'
 import {
   arcLength,
+  dedupePoints,
+  normalize,
   orientPolyline,
   resampleCount,
   slicePolylineByFraction,
@@ -20,7 +17,7 @@ export type TakenSpan = {
 }
 
 export type StrokeMatch = {
-  /** 参与变形的这一笔（两端离参考线太远的尾巴会去掉） */
+  /** 整笔都参与变形，长短不够就拉伸或缩短。跨过已画段时只留下还没画的几段 */
   source: Point[]
   /** 同一条参考轮廓上、从笔迹起点投影到终点投影的那一段 */
   target: Point[]
@@ -29,60 +26,151 @@ export type StrokeMatch = {
   spans: Array<[number, number]>
 }
 
-const SAMPLE_SPACING = 4
+const SAMPLE_N = 36
+
+/**
+ * 滑块仍是容差。搜索比滑块更宽：默认 36 时大约 50px 的偏移还能吸上，
+ * 半径 20、偏出约 50px 仍会落空。阈值不随笔迹变长而变严。
+ */
+function searchRadiusOf(radius: number) {
+  return Math.min(140, Math.max(radius + 12, radius * 2.15))
+}
 
 function mod(i: number, n: number) {
   return ((i % n) + n) % n
 }
 
-function sampleTangent(samples: Point[], i: number): Point {
-  const a = samples[Math.max(0, i - 1)]
-  const b = samples[Math.min(samples.length - 1, i + 1)]
-  const l = Math.hypot(b.x - a.x, b.y - a.y) || 1
-  return { x: (b.x - a.x) / l, y: (b.y - a.y) / l }
+/** 目标几乎不动、笔却走了很长：只是擦过，不是顺着这条线 */
+function grazes(advance: number, near: Point[]) {
+  if (near.length < 2) return true
+  const span = arcLength(near)
+  return advance < 70 && advance + 20 < span * 0.34
 }
 
-function tangentAt(contour: Contour, index: number): Point {
-  const pts = contour.points
-  const n = pts.length
-  if (n < 2) return { x: 1, y: 0 }
-  const i = mod(Math.round(index), n)
-  const i0 = contour.closed ? mod(i - 2, n) : Math.max(0, i - 2)
-  const i1 = contour.closed ? mod(i + 2, n) : Math.min(n - 1, i + 2)
-  const l = Math.hypot(pts[i1].x - pts[i0].x, pts[i1].y - pts[i0].y) || 1
-  return { x: (pts[i1].x - pts[i0].x) / l, y: (pts[i1].y - pts[i0].y) / l }
-}
-
-type Hit = { index: number; dist: number; dir: number }
-
-function hitOn(
-  hits: Array<{ contourId: number; index: number; dist: number }>,
-  contour: Contour,
-  tangent: Point,
-  radius: number,
-): Hit | null {
-  let best: Hit | null = null
-  let bestD = radius + 1
-  for (const hit of hits) {
-    if (hit.contourId !== contour.id || hit.dist > radius) continue
-    if (hit.dist < bestD) {
-      bestD = hit.dist
-      const tan = tangentAt(contour, hit.index)
-      best = {
-        index: hit.index,
-        dist: hit.dist,
-        dir: tan.x * tangent.x + tan.y * tangent.y,
-      }
-    }
+function meanAlign(samples: Point[], target: Point[]) {
+  if (target.length < 2 || samples.length < 2) return 0
+  const n = Math.min(8, Math.max(3, samples.length))
+  const a = resampleCount(samples, n)
+  const b = resampleCount(target, n)
+  let sum = 0
+  let count = 0
+  for (let i = 1; i < n - 1; i++) {
+    const st = normalize(a[i + 1].x - a[i - 1].x, a[i + 1].y - a[i - 1].y)
+    const tt = normalize(b[i + 1].x - b[i - 1].x, b[i + 1].y - b[i - 1].y)
+    sum += Math.abs(st.x * tt.x + st.y * tt.y)
+    count++
   }
-  return best
+  return count ? sum / count : 0
+}
+
+type Obs = { si: number; index: number; dist: number }
+
+type Built = {
+  target: Point[]
+  mean: number
+  covered: number
+  align: number
+  advance: number
+  score: number
+  startU: number
+  endU: number
 }
 
 /**
- * 从当前下标顺着笔迹方向找下一个投影。
- * 只往前看一段，避免折返的轮廓把笔吸回已经走过的地方。
+ * 在笔迹顺序上找一段下标大体单调的投影。
+ * 轮廓折返回来、局部更近的另一截会被当成离群点跳过，不会把目标切成一小段。
  */
-function projectForward(
+function monotoneChain(obs: Obs[], sign: number, n: number, closed: boolean): number[] {
+  const m = obs.length
+  if (m === 0) return []
+  const prev = new Int32Array(m).fill(-1)
+  const len = new Int32Array(m).fill(1)
+  const jump = new Float64Array(m).fill(0)
+  let best = 0
+  const stepCap = Math.max(90, n * 0.3)
+  for (let i = 0; i < m; i++) {
+    for (let j = 0; j < i; j++) {
+      let du = obs[i].index - obs[j].index
+      if (closed) {
+        if (du > n / 2) du -= n
+        if (du < -n / 2) du += n
+      }
+      const forward = sign > 0 ? du : -du
+      if (forward < -10 || forward > stepCap) continue
+      const better = len[j] + 1 > len[i] || (len[j] + 1 === len[i] && forward < jump[i])
+      if (!better) continue
+      len[i] = len[j] + 1
+      prev[i] = j
+      jump[i] = forward
+    }
+    if (len[i] > len[best] || (len[i] === len[best] && obs[i].dist < obs[best].dist)) best = i
+  }
+  const chain: number[] = []
+  for (let i = best; i >= 0; i = prev[i]) {
+    chain.push(i)
+    if (prev[i] < 0) break
+  }
+  chain.reverse()
+  return chain
+}
+
+function buildChain(
+  contour: Contour,
+  samples: Point[],
+  obs: Obs[],
+  searchR: number,
+  sign: number,
+): Built | null {
+  const n = contour.points.length
+  const chain = monotoneChain(obs, sign, n, contour.closed)
+  if (chain.length < 4) return null
+  const picked = chain.map((i) => obs[i])
+  const mean = picked.reduce((s, o) => s + o.dist, 0) / picked.length
+  if (mean > searchR * 0.96) return null
+
+  let startU = picked[0].index
+  let endU = picked[picked.length - 1].index
+  if (!contour.closed) {
+    if (sign > 0) {
+      if (startU <= 12) startU = 0
+      if (endU >= n - 13) endU = n - 1
+    } else {
+      if (startU >= n - 13) startU = n - 1
+      if (endU <= 12) endU = 0
+    }
+  }
+
+  let target: Point[]
+  if (contour.closed && Math.abs(endU - startU) >= n * 0.92) {
+    const origin = mod(Math.round(startU), n)
+    startU = origin
+    endU = origin + (sign >= 0 ? n : -n)
+    target = sliceContour(contour, startU, endU)
+  } else {
+    target = sliceContour(contour, startU, endU)
+  }
+  if (target.length < 2) return null
+  const near = picked.map((o) => samples[o.si])
+  target = orientPolyline(near, target)
+  let advance = arcLength(target)
+  if (advance < 18) {
+    const whole = arcLength(contour.points)
+    if (whole <= 220 && whole > advance + 8 && mean <= searchR * 0.72) {
+      target = orientPolyline(near, contour.points.map((p) => ({ ...p })))
+      advance = whole
+      startU = 0
+      endU = contour.closed ? n : n - 1
+    }
+  }
+  if (advance < 8) return null
+  const align = meanAlign(near, target)
+  if (align < 0.16 && advance < 40) return null
+  if (grazes(advance, near)) return null
+  const score = (searchR - mean) * picked.length + align * 10 + Math.min(advance, 1200) * 0.035
+  return { target, mean, covered: picked.length, align, advance, score, startU, endU }
+}
+
+function projectAhead(
   contour: Contour,
   x: number,
   y: number,
@@ -90,21 +178,24 @@ function projectForward(
   sign: number,
   radius: number,
   maxArc: number,
+  penMoved: number,
 ): number | null {
   const pts = contour.points
   const n = pts.length
   if (n < 2) return null
   let best = -1
-  let bestD = radius
+  let bestCost = Infinity
   let arc = 0
   let i = Math.round(from)
-  const limit = n + 2
-  for (let step = 0; step < limit; step++) {
+  for (let step = 0; step < n + 2; step++) {
     const p = pts[mod(i, n)]
     const d = Math.hypot(p.x - x, p.y - y)
-    if (d < bestD) {
-      bestD = d
-      best = i
+    if (d <= radius) {
+      const cost = d + 0.65 * Math.abs(arc - penMoved)
+      if (cost < bestCost) {
+        bestCost = cost
+        best = i
+      }
     }
     if (!contour.closed && ((sign >= 0 && i >= n - 1) || (sign < 0 && i <= 0))) break
     const next = i + sign
@@ -112,13 +203,135 @@ function projectForward(
     const a = pts[mod(i, n)]
     const b = pts[mod(next, n)]
     arc += Math.hypot(b.x - a.x, b.y - a.y)
-    if (step > 2 && arc > maxArc) break
+    if (step > 1 && arc > maxArc) break
     i = next
   }
   return best < 0 ? null : best
 }
 
-const JOIN_STEPS = 1
+/** 从贴得最近的一点顺着笔走，只在附近的弧长里找，避免跳到折返的另一侧 */
+function followSign(
+  contour: Contour,
+  samples: Point[],
+  searchR: number,
+  anchorSi: number,
+  anchorIndex: number,
+  sign: number,
+): Built | null {
+  const n = contour.points.length
+  const at = new Array<number>(samples.length).fill(Number.NaN)
+  const seen = new Array<boolean>(samples.length).fill(false)
+  at[anchorSi] = anchorIndex
+  seen[anchorSi] = true
+  const stepTo = (si: number, prevSi: number, cursor: number, dir: number) => {
+    const moved = Math.hypot(samples[si].x - samples[prevSi].x, samples[si].y - samples[prevSi].y)
+    const next = projectAhead(
+      contour,
+      samples[si].x,
+      samples[si].y,
+      cursor,
+      dir,
+      searchR,
+      Math.max(110, moved * 3.2 + searchR),
+      moved,
+    )
+    if (next === null) return cursor
+    seen[si] = true
+    return next
+  }
+  let cursor = anchorIndex
+  for (let si = anchorSi + 1; si < samples.length; si++) {
+    cursor = stepTo(si, si - 1, cursor, sign)
+    at[si] = cursor
+  }
+  cursor = anchorIndex
+  for (let si = anchorSi - 1; si >= 0; si--) {
+    cursor = stepTo(si, si + 1, cursor, -sign)
+    at[si] = cursor
+  }
+  const near: Point[] = []
+  let distSum = 0
+  let first = -1
+  let last = -1
+  for (let si = 0; si < samples.length; si++) {
+    if (!seen[si] || Number.isNaN(at[si])) continue
+    const d = Math.hypot(
+      samples[si].x - contour.points[mod(Math.round(at[si]), n)].x,
+      samples[si].y - contour.points[mod(Math.round(at[si]), n)].y,
+    )
+    if (d > searchR) continue
+    if (first < 0) first = si
+    last = si
+    distSum += d
+    near.push(samples[si])
+  }
+  if (near.length < 4 || first < 0 || last <= first) return null
+  const mean = distSum / near.length
+  let startU = at[first]
+  let endU = at[last]
+  if (!contour.closed) {
+    const lo = Math.min(startU, endU)
+    const hi = Math.max(startU, endU)
+    const nlo = lo <= 8 ? 0 : lo
+    const nhi = hi >= n - 9 ? n - 1 : hi
+    if (startU <= endU) {
+      startU = nlo
+      endU = nhi
+    } else {
+      startU = nhi
+      endU = nlo
+    }
+  }
+  let target = sliceContour(contour, startU, endU)
+  if (target.length < 2) return null
+  target = orientPolyline(near, target)
+  const advance = arcLength(target)
+  if (advance < 8) return null
+  const align = meanAlign(near, target)
+  if (mean > searchR * 0.96) return null
+  if (align < 0.16 && advance < 40) return null
+  if (grazes(advance, near)) return null
+  const score = (searchR - mean) * near.length + align * 10 + Math.min(advance, 1200) * 0.035
+  return { target, mean, covered: near.length, align, advance, score, startU, endU }
+}
+
+function betterBuilt(a: Built | null, b: Built | null) {
+  if (!a) return b
+  if (!b) return a
+  return b.score > a.score ? b : a
+}
+
+function indexTaken(mask: Uint8Array | undefined, index: number, n: number) {
+  if (!mask || n === 0) return false
+  return mask[mod(Math.round(index), n)] === 1
+}
+
+function matchContour(
+  contour: Contour,
+  samples: Point[],
+  hits: Array<Array<{ contourId: number; index: number; dist: number }>>,
+  searchR: number,
+  mask?: Uint8Array,
+): Built | null {
+  const obs: Obs[] = []
+  const n = contour.points.length
+  for (let si = 0; si < samples.length; si++) {
+    const hit = hits[si].find((h) => h.contourId === contour.id)
+    if (!hit || hit.dist > searchR) continue
+    if (indexTaken(mask, hit.index, n)) continue
+    obs.push({ si, index: hit.index, dist: hit.dist })
+  }
+  if (obs.length < 4) return null
+  let best = betterBuilt(
+    buildChain(contour, samples, obs, searchR, 1),
+    buildChain(contour, samples, obs, searchR, -1),
+  )
+  let anchor = obs[0]
+  for (const o of obs) if (o.dist < anchor.dist) anchor = o
+  best = betterBuilt(best, followSign(contour, samples, searchR, anchor.si, anchor.index, 1))
+  best = betterBuilt(best, followSign(contour, samples, searchR, anchor.si, anchor.index, -1))
+  return best
+}
 
 function buildTakenMasks(
   byId: Map<number, Contour>,
@@ -142,83 +355,6 @@ function buildTakenMasks(
     }
   }
   return masks
-}
-
-/** 最近点已画过时，只允许跨到紧邻的一格，用来接上还没画的下一段 */
-function nearestFreeIndex(
-  contour: Contour,
-  index: number,
-  x: number,
-  y: number,
-  radius: number,
-  mask: Uint8Array,
-): number | null {
-  const pts = contour.points
-  const n = pts.length
-  if (n === 0) return null
-  const i0 = mod(Math.round(index), n)
-  if (!mask[i0]) return i0
-  let best = -1
-  let bestD = radius
-  for (let step = 1; step <= JOIN_STEPS; step++) {
-    for (const dir of [-1, 1] as const) {
-      const raw = i0 + dir * step
-      if (!contour.closed && (raw < 0 || raw >= n)) continue
-      const i = mod(raw, n)
-      if (mask[i]) continue
-      const d = Math.hypot(pts[i].x - x, pts[i].y - y)
-      if (d <= radius && (best < 0 || d < bestD)) {
-        best = i
-        bestD = d
-      }
-    }
-  }
-  return best < 0 ? null : best
-}
-
-function adoptHit(
-  hit: Hit | null,
-  contour: Contour,
-  tangent: Point,
-  x: number,
-  y: number,
-  radius: number,
-  mask?: Uint8Array,
-): Hit | null {
-  if (!hit || !mask) return hit
-  const free = nearestFreeIndex(contour, hit.index, x, y, radius, mask)
-  if (free === null) return null
-  if (free === mod(Math.round(hit.index), contour.points.length)) return hit
-  const tan = tangentAt(contour, free)
-  return {
-    index: free,
-    dist: Math.hypot(contour.points[free].x - x, contour.points[free].y - y),
-    dir: tan.x * tangent.x + tan.y * tangent.y,
-  }
-}
-
-/** 正压在已画线段上，而且附近没有更近的未画线 */
-function sampleOnTakenInk(
-  hits: Array<{ contourId: number; index: number; dist: number }>,
-  byId: Map<number, Contour>,
-  masks: Map<number, Uint8Array>,
-  x: number,
-  y: number,
-  radius: number,
-): boolean {
-  let blocked = Number.POSITIVE_INFINITY
-  let free = Number.POSITIVE_INFINITY
-  for (const hit of hits) {
-    if (hit.dist > radius) continue
-    const contour = byId.get(hit.contourId)
-    if (!contour) continue
-    const mask = masks.get(hit.contourId)
-    const taken =
-      !!mask && nearestFreeIndex(contour, hit.index, x, y, radius, mask) === null
-    if (taken) blocked = Math.min(blocked, hit.dist)
-    else free = Math.min(free, hit.dist)
-  }
-  return blocked + 1 < free
 }
 
 function walkContourIndices(contour: Contour, startU: number, endU: number): number[] {
@@ -258,61 +394,88 @@ function compressSpans(indices: number[]): Array<[number, number]> {
   return spans
 }
 
-function markWalk(mask: Uint8Array, contour: Contour, startU: number, endU: number) {
-  for (const i of walkContourIndices(contour, startU, endU)) mask[i] = 1
-}
-
-type ForwardStep =
-  | { kind: 'clear' }
-  | { kind: 'blocked'; extendTo: number | null; resume: number | null }
-
-/** 从当前投影走到下一个投影，看中间有没有已经画过的点 */
-function classifyStep(contour: Contour, from: number, to: number, mask: Uint8Array): ForwardStep {
-  const n = contour.points.length
-  const span = to - from
-  const dir = span >= 0 ? 1 : -1
-  const steps = Math.min(n, Math.max(0, Math.round(Math.abs(span))))
-  if (steps === 0) {
-    return mask[mod(Math.round(to), n)]
-      ? { kind: 'blocked', extendTo: null, resume: null }
-      : { kind: 'clear' }
-  }
-  let i = mod(Math.round(from), n)
-  let unwrapped = Math.round(from)
-  let seenTaken = false
-  let extendTo: number | null = null
-  let resume: number | null = null
-  for (let s = 1; s <= steps; s++) {
-    if (!contour.closed && (i + dir < 0 || i + dir >= n)) break
-    i = mod(i + dir, n)
-    unwrapped += dir
-    if (mask[i]) {
-      seenTaken = true
-      resume = null
-    } else if (!seenTaken) {
-      extendTo = unwrapped
-    } else if (resume === null) {
-      resume = unwrapped
+/** 正压在已画线段上，而且附近没有更近的未画线 */
+function sampleOnTakenInk(
+  hits: Array<{ contourId: number; index: number; dist: number }>,
+  byId: Map<number, Contour>,
+  masks: Map<number, Uint8Array>,
+): boolean {
+  let blocked = Number.POSITIVE_INFINITY
+  let free = Number.POSITIVE_INFINITY
+  for (const hit of hits) {
+    const contour = byId.get(hit.contourId)
+    if (!contour) continue
+    if (indexTaken(masks.get(hit.contourId), hit.index, contour.points.length)) {
+      blocked = Math.min(blocked, hit.dist)
+    } else {
+      free = Math.min(free, hit.dist)
     }
   }
-  if (!seenTaken) return { kind: 'clear' }
-  return { kind: 'blocked', extendTo, resume }
+  return blocked + 1 < free
 }
 
-function firstUnwrappedStep(contour: Contour, from: number, to: number): number | null {
-  const span = to - from
-  if (Math.round(Math.abs(span)) < 1) return null
-  const dir = span >= 0 ? 1 : -1
-  const raw = Math.round(from) + dir
-  if (!contour.closed && (raw < 0 || raw >= contour.points.length)) return null
-  return raw
+function emitMatches(
+  contour: Contour,
+  raw: Point[],
+  built: Built,
+  mask: Uint8Array | undefined,
+): StrokeMatch[] | null {
+  const indices = walkContourIndices(contour, built.startU, built.endU)
+  if (indices.length < 2) return null
+  const hasTaken = !!mask && indices.some((i) => mask[i] === 1)
+  if (!hasTaken) {
+    const source = raw.map((p) => ({ ...p }))
+    const target = orientPolyline(source, built.target)
+    if (target.length < 2 || arcLength(target) < 8) return null
+    const spans = compressSpans(indices)
+    if (spans.length === 0) return null
+    return [{ source, target, contourId: contour.id, spans }]
+  }
+
+  const pieces: StrokeMatch[] = []
+  const denom = Math.max(1, indices.length - 1)
+  let run: number[] = []
+  let runStart = 0
+  const flush = (end: number) => {
+    if (run.length < 2) {
+      run = []
+      return
+    }
+    const f0 = runStart / denom
+    const f1 = end / denom
+    const source = slicePolylineByFraction(raw, f0, f1)
+    let target = dedupePoints(run.map((i) => ({ ...contour.points[i] })))
+    if (source.length < 2 || target.length < 2) {
+      run = []
+      return
+    }
+    target = orientPolyline(source, target)
+    if (arcLength(target) < 8) {
+      run = []
+      return
+    }
+    const spans = compressSpans(run)
+    if (spans.length > 0) pieces.push({ source, target, contourId: contour.id, spans })
+    run = []
+  }
+  for (let k = 0; k < indices.length; k++) {
+    if (mask![indices[k]]) {
+      if (run.length > 0) flush(k - 1)
+      continue
+    }
+    if (run.length === 0) runStart = k
+    run.push(indices[k])
+  }
+  if (run.length > 0) flush(indices.length - 1)
+  return pieces.length > 0 ? pieces : null
 }
 
 /**
- * 抬笔后只选一条最贴合的参考轮廓。
- * 目标是这条轮廓上、从笔迹起点的投影走到终点投影的那一整段（拐角也顺着走）。
- * 已经画过的下标会跳过，同一段线不会再匹配一次；一笔跨过已画段时，只留下还没画的几段。
- * 整笔变形到这些线上；只有两端超出吸附距离的部分会丢掉。
+ * 抬笔后只选一条参考轮廓。
+ * 看整段形状和位置，不拿笔迹长度去卡目标长度。
+ * 目标是这条轮廓上从起点投影走到终点投影的一段；笔伸出端点就收到轮廓为止。
+ * 已经画过的下标会跳过，同一段线不会再匹配一次。
+ * 整笔再按弧长拉到这段上。周围没有够近的线才放弃。
  */
 export function matchFinishedStroke(
   raw: Point[],
@@ -322,197 +485,41 @@ export function matchFinishedStroke(
   taken?: readonly TakenSpan[],
 ): StrokeMatch[] | null {
   if (raw.length < 2 || contours.length === 0 || radius < 1) return null
-  const strokeLen = arcLength(raw)
-  if (strokeLen < 6) return null
+  if (arcLength(raw) < 6) return null
 
-  const sampleCount = Math.max(2, Math.round(strokeLen / SAMPLE_SPACING) + 1)
-  const samples = resampleCount(raw, sampleCount)
-  if (samples.length < 2) return null
+  const searchR = searchRadiusOf(radius)
+  const samples = resampleCount(raw, SAMPLE_N)
   const byId = new Map(contours.map((c) => [c.id, c]))
-  const hits = samples.map((p) => queryHits(p.x, p.y, radius, contours, index))
+  const hits = samples.map((p) => queryHits(p.x, p.y, searchR, contours, index))
   const masks = buildTakenMasks(byId, taken)
 
-  const covered = new Map<number, number>()
-  let blockedCover = 0
-  for (let si = 0; si < samples.length; si++) {
-    const sample = samples[si]
-    if (
-      masks.size > 0 &&
-      sampleOnTakenInk(hits[si], byId, masks, sample.x, sample.y, radius)
-    ) {
-      blockedCover += SAMPLE_SPACING
-      continue
-    }
-    const tangent = sampleTangent(samples, si)
-    let bestId = -1
-    let bestScore = 0
-    for (const hit of hits[si]) {
-      if (hit.dist > radius) continue
-      const candidate = byId.get(hit.contourId)
-      if (!candidate) continue
-      const candidateMask = masks.get(hit.contourId)
-      let indexForTan = hit.index
-      if (candidateMask) {
-        const free = nearestFreeIndex(candidate, hit.index, sample.x, sample.y, radius, candidateMask)
-        if (free === null) continue
-        indexForTan = free
-      }
-      const tan = tangentAt(candidate, indexForTan)
-      const align = Math.abs(tan.x * tangent.x + tan.y * tangent.y)
-      if (align < 0.12 && hit.dist > radius * 0.55) continue
-      const score = (0.2 + align) * (1.08 - hit.dist / Math.max(1, radius))
-      if (score > bestScore) {
-        bestScore = score
-        bestId = hit.contourId
-      }
-    }
-    if (bestId >= 0) covered.set(bestId, (covered.get(bestId) ?? 0) + SAMPLE_SPACING)
-  }
-
-  let cid = -1
-  let bestCover = 0
-  for (const [id, len] of covered) {
-    if (len > bestCover) {
-      bestCover = len
-      cid = id
+  const votes = new Map<number, number>()
+  for (const list of hits) {
+    if (masks.size > 0 && sampleOnTakenInk(list, byId, masks)) continue
+    for (const hit of list) {
+      if (hit.dist > searchR) continue
+      const contour = byId.get(hit.contourId)
+      if (!contour) continue
+      if (indexTaken(masks.get(hit.contourId), hit.index, contour.points.length)) continue
+      votes.set(hit.contourId, (votes.get(hit.contourId) ?? 0) + (1 - hit.dist / searchR))
     }
   }
-  const contour = cid >= 0 ? byId.get(cid) : undefined
-  if (!contour) return null
-  const n = contour.points.length
-  const mask = masks.get(contour.id)
-  // 贴住的部分太少，就当作没描到线，整笔淡出。压在已画线上的长度不算进分母。
-  const activeLen = Math.max(0, strokeLen - blockedCover)
-  if (bestCover < Math.max(16, activeLen * 0.22)) return null
+  const ranked = [...votes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
 
-  let sign = 0
-  let travel = 0
-  let travelN = 0
-  let prevIdx = -1
-  let tangentVote = 0
-  let tangentN = 0
-  for (let si = 0; si < samples.length && travelN < 10; si++) {
-    const tangent = sampleTangent(samples, si)
-    const hit = adoptHit(
-      hitOn(hits[si], contour, tangent, radius),
-      contour,
-      tangent,
-      samples[si].x,
-      samples[si].y,
-      radius,
-      mask,
-    )
-    if (!hit) continue
-    if (Math.abs(hit.dir) >= 0.08) {
-      tangentVote += hit.dir
-      tangentN++
+  let best: Built | null = null
+  let bestId = -1
+  for (const [id, vote] of ranked) {
+    if (vote < 1.2) continue
+    const contour = byId.get(id)
+    if (!contour) continue
+    const built = matchContour(contour, samples, hits, searchR, masks.get(id))
+    if (!built) continue
+    if (!best || built.score > best.score) {
+      best = built
+      bestId = id
     }
-    if (prevIdx >= 0) {
-      let du = hit.index - prevIdx
-      if (contour.closed) {
-        if (du > n / 2) du -= n
-        if (du < -n / 2) du += n
-      }
-      travel += du
-      travelN++
-    }
-    prevIdx = hit.index
   }
-  if (tangentN === 0 && travelN === 0) return null
-  if (Math.abs(travel) >= 2) sign = travel < 0 ? -1 : 1
-  else sign = tangentVote < 0 ? -1 : 1
-
-  type Run = { startU: number; endU: number; firstSi: number; lastSi: number }
-  const runs: Run[] = []
-  let run: Run | null = null
-  let cursor = 0
-  let prevSi = -1
-  let skipping = false
-
-  const commit = () => {
-    if (run && run.lastSi > run.firstSi) {
-      runs.push(run)
-      if (mask) markWalk(mask, contour, run.startU, run.endU)
-    }
-    run = null
-  }
-
-  for (let si = 0; si < samples.length; si++) {
-    if (!run && !skipping) {
-      const tangent = sampleTangent(samples, si)
-      const hit = adoptHit(
-        hitOn(hits[si], contour, tangent, radius),
-        contour,
-        tangent,
-        samples[si].x,
-        samples[si].y,
-        radius,
-        mask,
-      )
-      if (!hit) continue
-      run = { startU: hit.index, endU: hit.index, firstSi: si, lastSi: si }
-      cursor = hit.index
-      prevSi = si
-      continue
-    }
-
-    const moved = Math.hypot(samples[si].x - samples[prevSi].x, samples[si].y - samples[prevSi].y)
-    const from = cursor
-    const next = projectForward(contour, samples[si].x, samples[si].y, from, sign, radius, moved * 3 + 36)
-    if (next === null) continue
-
-    if (mask) {
-      const step = classifyStep(contour, from, next, mask)
-      if (step.kind === 'blocked') {
-        if (run && step.extendTo !== null) run.endU = step.extendTo
-        commit()
-        cursor = next
-        prevSi = si
-        if (step.resume === null) {
-          skipping = true
-        } else {
-          skipping = false
-          run = { startU: step.resume, endU: next, firstSi: si, lastSi: si }
-        }
-        continue
-      }
-    }
-
-    cursor = next
-    prevSi = si
-    if (!run) {
-      const startU = firstUnwrappedStep(contour, from, next) ?? next
-      run = { startU, endU: next, firstSi: si, lastSi: si }
-      skipping = false
-      continue
-    }
-    run.endU = next
-    run.lastSi = si
-    skipping = false
-  }
-  commit()
-  if (runs.length === 0) return null
-
-  const denom = Math.max(1, samples.length - 1)
-  const pieces: StrokeMatch[] = []
-  for (const piece of runs) {
-    let f0 = piece.firstSi / denom
-    let f1 = piece.lastSi / denom
-    if (f0 < 0.06) f0 = 0
-    if (f1 > 0.94) f1 = 1
-    const source =
-      f0 <= 0 && f1 >= 1 ? raw.map((p) => ({ ...p })) : slicePolylineByFraction(raw, f0, f1)
-    let target = sliceContour(contour, piece.startU, piece.endU)
-    if (source.length < 2 || target.length < 2) continue
-    target = orientPolyline(source, target)
-    const sl = arcLength(source)
-    const tl = arcLength(target)
-    if (tl < 10 || sl < 6) continue
-    // 闭合线不要绕远路，把整圈都算进这一笔
-    if (contour.closed && tl > sl * 1.8 + 36 && tl > arcLength(contour.points) * 0.72) continue
-    const spans = compressSpans(walkContourIndices(contour, piece.startU, piece.endU))
-    if (spans.length === 0) continue
-    pieces.push({ source, target, contourId: contour.id, spans })
-  }
-  return pieces.length > 0 ? pieces : null
+  const contour = bestId >= 0 ? byId.get(bestId) : undefined
+  if (!best || !contour) return null
+  return emitMatches(contour, raw, best, masks.get(contour.id))
 }

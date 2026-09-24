@@ -264,7 +264,7 @@ function App() {
           </p>
         </div>
         <p className="max-w-xs text-xs leading-relaxed text-muted sm:text-right">
-          一笔可以盖住相连的好几段轮廓。离得太远的乱笔会淡出。
+          离得太远的乱笔会淡出。
         </p>
       </header>
 
