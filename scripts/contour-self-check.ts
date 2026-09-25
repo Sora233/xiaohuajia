@@ -639,6 +639,17 @@ function nearestContour(
   assert(mask.lineArt, '黑白线稿被当成了彩色图')
 }
 
+// 只有一个很淡的色点，也按彩色图处理
+{
+  const W = 80
+  const H = 40
+  const data = paper(W, H)
+  for (let x = 6; x <= 72; x++) inkAt(data, W, x, 18)
+  paint(data, W, 4, 4, [248, 244, 240])
+  const mask = extractMaskFromRgba(data, W, H, 62)
+  assert(!mask.lineArt, '淡色像素没有被当成彩色图')
+}
+
 // 黄底上的色块：轮廓贴着边界，不能从色块中间穿过去
 {
   const W = 160

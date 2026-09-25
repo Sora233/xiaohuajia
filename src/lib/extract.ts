@@ -55,18 +55,19 @@ function gaussianBlur5(src: Float32Array, width: number, height: number): Float3
   return out
 }
 
-/** 饱和像素够多就是彩色图。色块不能按黑白线稿整块当墨迹。 */
+/**
+ * 只要有一个不透明像素的通道不完全相等，就按彩色图处理。
+ * 纯灰度才留给黑白线稿和黑白照片。上传的图绝大多数带颜色，判定放到最宽。
+ */
 function isColorful(data: Uint8ClampedArray): boolean {
-  const n = data.length >> 2
-  if (n === 0) return false
-  let strong = 0
   for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] === 0) continue
     const r = data[i]
     const g = data[i + 1]
     const b = data[i + 2]
-    if (Math.max(r, g, b) - Math.min(r, g, b) > 28) strong++
+    if (r !== g || g !== b) return true
   }
-  return strong / n > 0.06
+  return false
 }
 
 /** 可分离盒式模糊。窗口在边上按实际像素数归一，避免把线端拉偏。 */
