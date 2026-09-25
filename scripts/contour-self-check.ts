@@ -1,5 +1,5 @@
 import { buildSpatialIndex, takeTraceTimings, traceContours } from '@/lib/contours'
-import { extractMaskFromRgba, runExtraction } from '@/lib/extract'
+import { runExtraction } from '@/lib/extract'
 import { matchFinishedStroke } from '@/lib/match-stroke'
 import { arcLength, resampleSpacing } from '@/lib/polyline'
 
@@ -503,7 +503,7 @@ function lengthsOf(contours: Array<{ points: { x: number; y: number }[] }>) {
   return contours.map((c) => arcLength(c.points)).sort((a, b) => b - a)
 }
 
-// 粗线应收成一条中心线，而不是并排的两条边
+// 粗线沿墨块边界走一圈，不从色块中间抽一条脊
 {
   const W = 160
   const H = 80
@@ -513,9 +513,10 @@ function lengthsOf(contours: Array<{ points: { x: number; y: number }[] }>) {
   }
   const { contours } = runExtraction(data, W, H, 62)
   const lens = lengthsOf(contours)
-  console.log('粗线中心', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','))
-  assert(contours.length <= 2, `4px 粗线裂成了太多条：${contours.length}`)
-  assert(lens[0] > 90 && lens[0] < 180, `4px 粗线没有收到中心线：${lens[0]?.toFixed(0)}`)
+  console.log('粗线边界', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','))
+  assert(contours.length === 1, `4px 粗线裂成了 ${contours.length} 条`)
+  assert(contours[0].closed, '粗线边界没有闭合')
+  assert(lens[0] > 200 && lens[0] < 340, `粗线周长不对：${lens[0]?.toFixed(0)}`)
 }
 
 // 实心块取外边界，不抽成一根短脊
@@ -535,7 +536,7 @@ function lengthsOf(contours: Array<{ points: { x: number; y: number }[] }>) {
   assert(total < 420, `实心块骨架太碎：${total.toFixed(0)}`)
 }
 
-// 成片网点只留一块外轮廓
+// 网点是分开的小墨点，各自成圈
 {
   const W = 130
   const H = 100
@@ -551,11 +552,11 @@ function lengthsOf(contours: Array<{ points: { x: number; y: number }[] }>) {
   const { contours } = runExtraction(data, W, H, 62)
   const lens = lengthsOf(contours)
   console.log('网点', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','))
-  assert(contours.length <= 3, `网点被拆成很多条：${contours.length}`)
-  assert(lens[0] > 160, `网点没有留下外轮廓：${lens[0]?.toFixed(0)}`)
+  assert(contours.length > 20, `网点被收成了太少的圈：${contours.length}`)
+  assert(lens[0] < 48, `网点被连成了长线：${lens[0]?.toFixed(0)}`)
 }
 
-// 3px 粗线中间断开约 24px，两边都够长时应接成一条
+// 中间断开的粗线保持两段
 {
   const W = 180
   const H = 70
@@ -567,18 +568,26 @@ function lengthsOf(contours: Array<{ points: { x: number; y: number }[] }>) {
     for (let t = 0; t < 3; t++) inkAt(data, W, x, 30 + t)
   }
   const { contours } = runExtraction(data, W, H, 62)
-  const main = contours.slice().sort((a, b) => arcLength(b.points) - arcLength(a.points))[0]
-  const xs = main ? [main.points[0].x, main.points[main.points.length - 1].x] : [0, 0]
+  const longs = contours
+    .filter((c) => arcLength(c.points) > 80)
+    .sort((a, b) => arcLength(b.points) - arcLength(a.points))
+  const span = (c: (typeof longs)[number]) => {
+    const xs = c.points.map((p) => p.x)
+    return [Math.min(...xs), Math.max(...xs)]
+  }
   console.log(
     '宽缺口',
     '条数',
     contours.length,
     '长度',
     lengthsOf(contours).map((n) => Math.round(n)).join(','),
-    '端点',
-    xs.map((n) => Math.round(n)).join(','),
+    '范围',
+    longs.map((c) => span(c).map((n) => Math.round(n)).join('-')).join(' | '),
   )
-  assert(main && Math.min(...xs) < 16 && Math.max(...xs) > 155, '24px 共线缺口没有接上')
+  assert(longs.length === 2, `断开的粗线不是两段：${longs.length}`)
+  const left = span(longs[0])[0] < span(longs[1])[0] ? span(longs[0]) : span(longs[1])
+  const right = left === span(longs[0]) ? span(longs[1]) : span(longs[0])
+  assert(left[1] < 85 && right[0] > 80, `缺口被焊上了：${left.join(',')} / ${right.join(',')}`)
 }
 
 // 相距 16px 的平行线保持两条，不能被闭运算或补缺焊在一起
@@ -629,27 +638,6 @@ function nearestContour(
   return best
 }
 
-// 黑白细线仍按墨迹提，不走彩色局部对比
-{
-  const W = 80
-  const H = 40
-  const data = paper(W, H)
-  for (let x = 6; x <= 72; x++) inkAt(data, W, x, 18)
-  const mask = extractMaskFromRgba(data, W, H, 62)
-  assert(mask.lineArt, '黑白线稿被当成了彩色图')
-}
-
-// 只有一个很淡的色点，也按彩色图处理
-{
-  const W = 80
-  const H = 40
-  const data = paper(W, H)
-  for (let x = 6; x <= 72; x++) inkAt(data, W, x, 18)
-  paint(data, W, 4, 4, [248, 244, 240])
-  const mask = extractMaskFromRgba(data, W, H, 62)
-  assert(!mask.lineArt, '淡色像素没有被当成彩色图')
-}
-
 // 黄底上的色块：轮廓贴着边界，不能从色块中间穿过去
 {
   const W = 160
@@ -668,13 +656,11 @@ function nearestContour(
       if ((x - cx) ** 2 + (y - cy) ** 2 <= radius * radius) paint(data, W, x, y, brown)
     }
   }
-  const mask = extractMaskFromRgba(data, W, H, 62)
   const { contours } = runExtraction(data, W, H, 62)
   const lens = lengthsOf(contours)
   const total = lens.reduce((s, n) => s + n, 0)
   const mid = nearestContour(contours, cx, cy)
-  console.log('彩色色块', '线稿', mask.lineArt, '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','), '中心距', mid.toFixed(1))
-  assert(!mask.lineArt, '彩色色块被当成了黑白线稿')
+  console.log('彩色色块', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','), '中心距', mid.toFixed(1))
   assert(mid > 16, `轮廓穿过了色块中心，距离 ${mid.toFixed(1)}`)
   assert(total > 120 && total < 420, `色块边界长度不对：${total.toFixed(0)}`)
 }
@@ -709,7 +695,7 @@ function nearestContour(
   assert(Math.abs(ys[0] - 23) < 4 && Math.abs(ys[1] - 47) < 4, `彩色线没有落在笔画上：${ys.join(',')}`)
 }
 
-// 深色块内部的黑线要留下来，不能被整块色填掉
+// 深色块留外轮廓，块里更深的笔划单独留下，平涂的中间不被穿过
 {
   const W = 200
   const H = 140
@@ -727,10 +713,11 @@ function nearestContour(
   }
   const { contours } = runExtraction(data, W, H, 62)
   const onStroke = contours.filter((c) => {
-    const near = c.points.filter((p) => Math.abs(p.y - 71) < 4).length
+    const near = c.points.filter((p) => Math.abs(p.y - 71) < 5).length
     return near > 12 && arcLength(c.points) > 70
   })
   const pocket = nearestContour(contours, 48, 40)
+  const lens = lengthsOf(contours)
   console.log(
     '色块内描边',
     '条数',
@@ -740,10 +727,11 @@ function nearestContour(
     '空腔距',
     pocket.toFixed(1),
     '长度',
-    lengthsOf(contours).map((n) => Math.round(n)).join(','),
+    lens.map((n) => Math.round(n)).join(','),
   )
   assert(onStroke.length >= 1, '色块内部的黑线丢了')
-  assert(pocket > 12, `色块内部被骨架穿过：${pocket.toFixed(1)}`)
+  assert(pocket > 12, `色块内部被线穿过：${pocket.toFixed(1)}`)
+  assert(lens[0] > 300, `色块外轮廓太短：${lens[0]?.toFixed(0)}`)
 }
 
 console.log('contour self-check ok')
