@@ -41,3 +41,12 @@ input,
 label {
   font-family: inherit;
 }
+
+@keyframes xh-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

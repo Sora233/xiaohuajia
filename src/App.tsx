@@ -26,8 +26,14 @@ import { cn } from '@/lib/utils'
 
 /** 线条细节固定为 50，页面上不再提供调节。 */
 const LINE_DETAIL = 50
-const LINE_HOLD_MS = 1600
+/** 原图单独停留，处理期间已经看过的时间会扣掉。 */
+const ORIGINAL_HOLD_MS = 700
+/** 原图过渡成参考图，时间拉长，变化才看得清。 */
+const MORPH_MS = 2400
+/** 参考图停稳后再开始缩小。 */
+const LINE_SETTLE_MS = 400
 const LINE_SHRINK_MS = 1600
+const MORPH_EASE = 'cubic-bezier(0.45, 0.05, 0.55, 0.95)'
 
 type Phase = 'pick' | 'lines' | 'draw'
 type Box = { left: number; top: number; width: number; height: number }
@@ -65,6 +71,8 @@ function App() {
   const resetDrawRef = useRef(false)
   const colorRef = useRef(true)
   const ingestGen = useRef(0)
+  const introGen = useRef(0)
+  const originalShownAt = useRef(0)
   const lineUrlRef = useRef('')
   const processedRef = useRef<ProcessedImage | null>(null)
 
@@ -79,6 +87,10 @@ function App() {
   const [phase, setPhase] = useState<Phase>('pick')
   const [lineUrl, setLineUrl] = useState('')
   const [originalUrl, setOriginalUrl] = useState('')
+  const [previewUrl, setPreviewUrl] = useState('')
+  const [frameSize, setFrameSize] = useState<{ width: number; height: number } | null>(null)
+  const [showReference, setShowReference] = useState(false)
+  const [introId, setIntroId] = useState(0)
   const [modal, setModal] = useState<ModalKind | null>(null)
   const [flyer, setFlyer] = useState<Flyer | null>(null)
 
@@ -131,6 +143,7 @@ function App() {
         processedRef.current = next
         setProcessed(next)
         setOriginalUrl(next.color.toDataURL('image/png'))
+        setFrameSize({ width: next.width, height: next.height })
         publishLineSheet(next, colorRef.current)
         const lens = next.contours
           .map((c) => c.points.length)
@@ -164,11 +177,27 @@ function App() {
 
   const loadFromSrc = useCallback(
     async (src: string, resetDrawing: boolean) => {
-      if (resetDrawing) setPhase('pick')
+      // 打断上一次提取和还在播的预览，避免旧图缩进按钮
+      ingestGen.current += 1
+      const intro = ++introGen.current
+      lineUrlRef.current = ''
+      setLineUrl('')
+      setShowReference(false)
+      setFlyer(null)
+      setModal(null)
+      setIntroId(intro)
       try {
         const img = await loadHtmlImage(src)
+        if (intro !== introGen.current) return
+        const width = img.naturalWidth || img.width
+        const height = img.naturalHeight || img.height
+        originalShownAt.current = performance.now()
+        setPreviewUrl(src)
+        setFrameSize({ width, height })
+        setPhase('lines')
         await ingestImage(img, resetDrawing)
       } catch (err) {
+        if (intro !== introGen.current) return
         setError(err instanceof Error ? err.message : '无法读取这张图片')
         setHint('换一张图片再试试')
         setPhase('pick')
@@ -216,11 +245,18 @@ function App() {
 
   useEffect(() => {
     if (phase !== 'lines') return
-    const reduced = prefersReducedMotion()
-    // 线稿地址变了只换图，不重新计时，避免切换上色把预览再停一遍
-    const timer = window.setTimeout(() => {
+    // 只跟这一轮预览走。上色开关会换线稿地址，不从这里重开
+    let cancelled = false
+    const timers: number[] = []
+    const later = (fn: () => void, ms: number) => {
+      const id = window.setTimeout(() => {
+        if (!cancelled) fn()
+      }, ms)
+      timers.push(id)
+    }
+    const goDraw = () => {
       const frame = frameRef.current?.getBoundingClientRect()
-      if (!frame || reduced || !lineUrlRef.current) {
+      if (!frame || prefersReducedMotion() || !lineUrlRef.current) {
         setPhase('draw')
         return
       }
@@ -236,9 +272,30 @@ function App() {
         fading: false,
       })
       setPhase('draw')
-    }, reduced ? 400 : LINE_HOLD_MS)
-    return () => window.clearTimeout(timer)
-  }, [phase])
+    }
+    const waitLines = () => {
+      if (!lineUrlRef.current) {
+        later(waitLines, 40)
+        return
+      }
+      if (prefersReducedMotion()) {
+        setShowReference(true)
+        later(goDraw, 400)
+        return
+      }
+      const seen = performance.now() - originalShownAt.current
+      const holdLeft = Math.max(0, ORIGINAL_HOLD_MS - seen)
+      later(() => {
+        setShowReference(true)
+        later(goDraw, MORPH_MS + LINE_SETTLE_MS)
+      }, holdLeft)
+    }
+    waitLines()
+    return () => {
+      cancelled = true
+      for (const id of timers) window.clearTimeout(id)
+    }
+  }, [phase, introId])
 
   useLayoutEffect(() => {
     if (!flyer || flyer.to || phase !== 'draw') return
@@ -358,9 +415,13 @@ function App() {
     event.target.value = ''
   }
 
-  const box = processed
-    ? stageStyle(processed.width, processed.height)
-    : stageStyle(5, 4)
+  const box = stageStyle(frameSize?.width ?? processed?.width ?? 5, frameSize?.height ?? processed?.height ?? 4)
+  const morphOn = showReference && !prefersReducedMotion()
+  // 参考图底是不透明纸色，只淡入上层，避免两张一起变淡时中间发灰
+  const referenceFade: CSSProperties = {
+    opacity: showReference ? 1 : 0,
+    animation: morphOn ? `xh-fade-in ${MORPH_MS}ms ${MORPH_EASE} forwards` : 'none',
+  }
 
   const closeModal = useCallback(() => setModal(null), [])
 
@@ -470,13 +531,28 @@ function App() {
             )}
             style={box}
           >
-            {phase === 'lines' && lineUrl ? (
-              <img
-                src={lineUrl}
-                alt="参考图"
-                data-testid="line-preview"
-                className="absolute inset-0 h-full w-full object-contain"
-              />
+            {phase === 'lines' && (previewUrl || lineUrl) ? (
+              <>
+                {previewUrl && (
+                  <img
+                    src={previewUrl}
+                    alt=""
+                    data-testid="original-preview"
+                    aria-hidden={showReference}
+                    className="pointer-events-none absolute inset-0 h-full w-full object-contain"
+                  />
+                )}
+                {lineUrl && (
+                  <img
+                    src={lineUrl}
+                    alt="参考图"
+                    data-testid="line-preview"
+                    aria-hidden={!showReference}
+                    className="pointer-events-none absolute inset-0 h-full w-full object-contain"
+                    style={referenceFade}
+                  />
+                )}
+              </>
             ) : (
               <button
                 type="button"
@@ -492,7 +568,7 @@ function App() {
                 <p className="text-xs text-muted">也可以点「使用示例图」</p>
               </button>
             )}
-            {processing && (
+            {processing && !previewUrl && (
               <div
                 data-testid="processing"
                 className="absolute inset-0 grid place-items-center bg-paper/70 text-sm text-muted"
