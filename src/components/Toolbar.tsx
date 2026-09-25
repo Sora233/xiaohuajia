@@ -8,8 +8,6 @@ import {
 import type { ChangeEvent, RefObject } from 'react'
 
 import { Button } from '@/components/ui/button'
-import { Label } from '@/components/ui/label'
-import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 
 type ToolbarProps = {
@@ -17,13 +15,11 @@ type ToolbarProps = {
   hasImage: boolean
   canUndo: boolean
   processing: boolean
-  detail: number
   colorMode: boolean
   showRaw: boolean
   onUploadClick: () => void
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void
   onSample: () => void
-  onDetail: (value: number) => void
   onColorMode: (value: boolean) => void
   onShowRaw: (value: boolean) => void
   onUndo: () => void
@@ -36,13 +32,11 @@ export function Toolbar({
   hasImage,
   canUndo,
   processing,
-  detail,
   colorMode,
   showRaw,
   onUploadClick,
   onFileChange,
   onSample,
-  onDetail,
   onColorMode,
   onShowRaw,
   onUndo,
@@ -105,23 +99,7 @@ export function Toolbar({
         </div>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        <div className="space-y-2 rounded-xl bg-paper-2/70 px-3 py-2.5">
-          <div className="flex items-center justify-between">
-            <Label htmlFor="detail">线条细节</Label>
-            <span className="text-xs tabular-nums text-muted">{detail}</span>
-          </div>
-          <Slider
-            id="detail"
-            min={0}
-            max={100}
-            step={1}
-            value={[detail]}
-            onValueChange={(v) => onDetail(v[0] ?? detail)}
-            disabled={!hasImage || processing}
-          />
-        </div>
-
+      <div className="grid gap-3 sm:grid-cols-2">
         <label className="flex items-center justify-between gap-3 rounded-xl bg-paper-2/70 px-3 py-2.5">
           <div className="min-w-0">
             <p className="text-xs font-medium text-ink">参考图上色</p>
@@ -131,6 +109,7 @@ export function Toolbar({
             checked={colorMode}
             onCheckedChange={onColorMode}
             disabled={!hasImage}
+            data-testid="color-mode"
           />
         </label>
 

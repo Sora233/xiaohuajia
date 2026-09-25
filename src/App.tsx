@@ -1,56 +1,85 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
+  type CSSProperties,
   type ChangeEvent,
   type DragEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 
+import { ImageModal } from '@/components/ImageModal'
 import { Toolbar } from '@/components/Toolbar'
+import { Button } from '@/components/ui/button'
 import {
   loadHtmlImage,
   processSource,
   ProcessingCancelled,
   type ProcessedImage,
 } from '@/lib/image-process'
+import { renderLineSheet } from '@/lib/line-preview'
 import { SAMPLE_IMAGE_SRC } from '@/lib/sample'
 import { pointerToCanvas, StrokePainter } from '@/lib/stroke-painter'
 import { cn } from '@/lib/utils'
+
+/** 线条细节固定为 0，页面上不再提供调节。 */
+const LINE_DETAIL = 0
+const LINE_HOLD_MS = 1600
+const LINE_SHRINK_MS = 1600
+
+type Phase = 'pick' | 'lines' | 'draw'
+type Box = { left: number; top: number; width: number; height: number }
+type ModalKind = 'original' | 'lines'
+type Flyer = {
+  src: string
+  from: Box
+  to: Box | null
+  run: boolean
+  fading: boolean
+}
+
+function stageStyle(width: number, height: number): CSSProperties {
+  const ratio = width / Math.max(1, height)
+  return {
+    aspectRatio: `${width} / ${height}`,
+    width: `min(100%, calc(76vh * ${ratio}))`,
+  }
+}
+
+function prefersReducedMotion() {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches
+}
 
 function App() {
   const fileRef = useRef<HTMLInputElement>(null)
   const resultRef = useRef<HTMLCanvasElement>(null)
   const rawRef = useRef<HTMLCanvasElement>(null)
-  const refCanvasRef = useRef<HTMLCanvasElement>(null)
   const cursorRef = useRef<HTMLDivElement>(null)
   const painterRef = useRef(new StrokePainter())
   const objectUrlRef = useRef<string | null>(null)
   const imageRef = useRef<HTMLImageElement | null>(null)
   const drawingRef = useRef(false)
+  const frameRef = useRef<HTMLElement>(null)
+  const refBtnRef = useRef<HTMLSpanElement>(null)
+  const resetDrawRef = useRef(false)
+  const colorRef = useRef(true)
+  const ingestGen = useRef(0)
 
   const [processed, setProcessed] = useState<ProcessedImage | null>(null)
   const [processing, setProcessing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [dragOver, setDragOver] = useState(false)
-  const [detail, setDetail] = useState(62)
-  const [colorMode, setColorMode] = useState(false)
+  const [colorMode, setColorMode] = useState(true)
   const [showRaw, setShowRaw] = useState(false)
   const [canUndo, setCanUndo] = useState(false)
-  const [hint, setHint] = useState('先放一张参考图，再顺着线条的大致方向画')
-  const colorRef = useRef(colorMode)
-  const ingestGen = useRef(0)
-
-  const syncRefCanvas = useCallback((image: ProcessedImage) => {
-    const canvas = refCanvasRef.current
-    if (!canvas) return
-    canvas.width = image.width
-    canvas.height = image.height
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-    ctx.drawImage(image.color, 0, 0)
-  }, [])
+  const [hint, setHint] = useState('先放一张图，再顺着线条画')
+  const [phase, setPhase] = useState<Phase>('pick')
+  const [lineUrl, setLineUrl] = useState('')
+  const [originalUrl, setOriginalUrl] = useState('')
+  const [modal, setModal] = useState<ModalKind | null>(null)
+  const [flyer, setFlyer] = useState<Flyer | null>(null)
 
   const bindPainter = useCallback((image: ProcessedImage, reset: boolean) => {
     const painter = painterRef.current
@@ -71,22 +100,25 @@ function App() {
   }, [])
 
   const ingestImage = useCallback(
-    async (img: HTMLImageElement, nextDetail: number, resetDrawing: boolean) => {
+    async (img: HTMLImageElement, resetDrawing: boolean) => {
       const gen = ++ingestGen.current
       setProcessing(true)
       setError(null)
       setHint('处理中…')
+      setFlyer(null)
+      setModal(null)
       try {
-        // 先让「处理中…」画出来，再把重活交给 Worker
         await new Promise((r) => requestAnimationFrame(() => r(null)))
         await new Promise((r) => window.setTimeout(r, 0))
         if (gen !== ingestGen.current) return
-        const next = await processSource(img, nextDetail)
+        const next = await processSource(img, LINE_DETAIL)
         if (gen !== ingestGen.current) return
+        const sheet = renderLineSheet(next.contours, next.width, next.height)
         imageRef.current = img
+        resetDrawRef.current = resetDrawing
         setProcessed(next)
-        bindPainter(next, resetDrawing)
-        syncRefCanvas(next)
+        setOriginalUrl(next.color.toDataURL('image/png'))
+        setLineUrl(sheet.toDataURL('image/png'))
         const lens = next.contours
           .map((c) => c.points.length)
           .sort((a, b) => b - a)
@@ -101,31 +133,35 @@ function App() {
         }
         setHint(
           next.contours.length
-            ? `已提取 ${next.contours.length} 条轮廓。先画出自己的笔，抬笔后它会变形成参考线`
-            : '几乎没提取到轮廓，试试提高「线条细节」',
+            ? `已提取 ${next.contours.length} 条轮廓。顺着线画，抬笔后会贴上去`
+            : '几乎没提取到轮廓',
         )
+        setPhase('lines')
       } catch (err) {
         if (gen !== ingestGen.current || err instanceof ProcessingCancelled) return
         setError(err instanceof Error ? err.message : '处理失败')
         setHint('换一张图片再试试')
+        setPhase('pick')
       } finally {
         if (gen === ingestGen.current) setProcessing(false)
       }
     },
-    [bindPainter, syncRefCanvas],
+    [],
   )
 
   const loadFromSrc = useCallback(
     async (src: string, resetDrawing: boolean) => {
+      if (resetDrawing) setPhase('pick')
       try {
         const img = await loadHtmlImage(src)
-        await ingestImage(img, detail, resetDrawing)
+        await ingestImage(img, resetDrawing)
       } catch (err) {
         setError(err instanceof Error ? err.message : '无法读取这张图片')
         setHint('换一张图片再试试')
+        setPhase('pick')
       }
     },
-    [detail, ingestImage],
+    [ingestImage],
   )
 
   const loadFile = useCallback(
@@ -160,16 +196,93 @@ function App() {
   }, [colorMode])
 
   useEffect(() => {
-    const img = imageRef.current
-    if (!img) return
-    const handle = window.setTimeout(() => {
-      void ingestImage(img, detail, false)
-    }, 160)
-    return () => window.clearTimeout(handle)
-  }, [detail, ingestImage])
+    if (phase !== 'draw' || !processed) return
+    bindPainter(processed, resetDrawRef.current)
+    resetDrawRef.current = false
+  }, [phase, processed, bindPainter])
+
+  useEffect(() => {
+    if (phase !== 'lines' || !lineUrl) return
+    const reduced = prefersReducedMotion()
+    const timer = window.setTimeout(() => {
+      const frame = frameRef.current?.getBoundingClientRect()
+      if (!frame || reduced) {
+        setPhase('draw')
+        return
+      }
+      setFlyer({
+        src: lineUrl,
+        from: {
+          left: frame.left,
+          top: frame.top,
+          width: frame.width,
+          height: frame.height,
+        },
+        to: null,
+        run: false,
+        fading: false,
+      })
+      setPhase('draw')
+    }, reduced ? 400 : LINE_HOLD_MS)
+    return () => window.clearTimeout(timer)
+  }, [phase, lineUrl])
+
+  useLayoutEffect(() => {
+    if (!flyer || flyer.to || phase !== 'draw') return
+    const btn = refBtnRef.current?.getBoundingClientRect()
+    if (!btn) return
+    setFlyer((current) =>
+      current && !current.to
+        ? {
+            ...current,
+            to: { left: btn.left, top: btn.top, width: btn.width, height: btn.height },
+          }
+        : current,
+    )
+  }, [flyer, phase])
+
+  useEffect(() => {
+    if (!flyer?.to || flyer.run || flyer.fading) return
+    let second = 0
+    const first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => {
+        setFlyer((current) =>
+          current && current.to && !current.run ? { ...current, run: true } : current,
+        )
+      })
+    })
+    return () => {
+      cancelAnimationFrame(first)
+      if (second) cancelAnimationFrame(second)
+    }
+  }, [flyer])
+
+  useEffect(() => {
+    if (!flyer?.run || flyer.fading) return
+    const timer = window.setTimeout(() => {
+      setFlyer((current) => (current?.run ? { ...current, fading: true } : current))
+    }, LINE_SHRINK_MS + 240)
+    return () => window.clearTimeout(timer)
+  }, [flyer?.run, flyer?.fading])
+
+  useEffect(() => {
+    if (!flyer?.fading) return
+    const timer = window.setTimeout(() => setFlyer(null), 220)
+    return () => window.clearTimeout(timer)
+  }, [flyer?.fading])
+
+  useEffect(() => {
+    if (!modal) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setModal(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [modal])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (modal) return
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
         event.preventDefault()
         if (painterRef.current.undo()) setCanUndo(painterRef.current.canUndo())
@@ -177,7 +290,7 @@ function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [])
+  }, [modal])
 
   const updateCursor = useCallback(
     (event: ReactPointerEvent<HTMLCanvasElement>, visible: boolean) => {
@@ -193,7 +306,7 @@ function App() {
   )
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!processed || processing) return
+    if (!processed || processing || flyer) return
     event.preventDefault()
     event.currentTarget.setPointerCapture(event.pointerId)
     drawingRef.current = true
@@ -232,12 +345,45 @@ function App() {
     event.target.value = ''
   }
 
-  const aspect = processed
-    ? `${processed.width} / ${processed.height}`
-    : '5 / 4'
+  const box = processed
+    ? stageStyle(processed.width, processed.height)
+    : stageStyle(5, 4)
+
+  const closeModal = useCallback(() => setModal(null), [])
+
+  let flyerStyle: CSSProperties | undefined
+  if (flyer) {
+    const { from, to } = flyer
+    let transform = 'translate(0px, 0px) scale(1)'
+    if (flyer.run && to && from.width > 0 && from.height > 0) {
+      const dx = to.left + to.width / 2 - (from.left + from.width / 2)
+      const dy = to.top + to.height / 2 - (from.top + from.height / 2)
+      const scale = Math.min(to.width / from.width, to.height / from.height) * 0.92
+      transform = `translate(${dx}px, ${dy}px) scale(${Math.max(0.05, scale)})`
+    }
+    flyerStyle = {
+      left: from.left,
+      top: from.top,
+      width: from.width,
+      height: from.height,
+      transform,
+      opacity: flyer.fading ? 0 : 1,
+      transition: flyer.run
+        ? `transform ${LINE_SHRINK_MS}ms cubic-bezier(0.45, 0, 0.15, 1), opacity 200ms ease`
+        : 'none',
+    }
+  }
 
   return (
-    <div className="mx-auto flex min-h-svh max-w-6xl flex-col gap-5 px-4 py-6 md:gap-6 md:px-6 md:py-8">
+    <div
+      className="mx-auto flex min-h-svh max-w-7xl flex-col gap-4 px-4 py-5 md:gap-5 md:px-6 md:py-6"
+      onDragOver={(e) => {
+        e.preventDefault()
+        setDragOver(true)
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={onDrop}
+    >
       <header className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <p className="text-[11px] font-medium tracking-[0.22em] text-cinnabar">
@@ -247,7 +393,7 @@ function App() {
             《小画家模拟器》
           </h1>
           <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
-            左边是参考，右边顺着轮廓的方向画。画的时候是你自己的线；抬笔后，它会缓缓弯过去，变成对应的参考线。
+            顺着线条画。抬笔之后，笔迹会变成图上的那条线。
           </p>
         </div>
         <p className="max-w-xs text-xs leading-relaxed text-muted sm:text-right">
@@ -260,7 +406,6 @@ function App() {
         hasImage={Boolean(processed)}
         canUndo={canUndo}
         processing={processing}
-        detail={detail}
         colorMode={colorMode}
         showRaw={showRaw}
         onUploadClick={() => fileRef.current?.click()}
@@ -268,7 +413,6 @@ function App() {
         onSample={() => {
           void loadFromSrc(SAMPLE_IMAGE_SRC, true)
         }}
-        onDetail={setDetail}
         onColorMode={setColorMode}
         onShowRaw={setShowRaw}
         onUndo={() => {
@@ -297,49 +441,38 @@ function App() {
         <p className="text-xs text-muted">{hint}</p>
       )}
 
-      <div
-        className="grid flex-1 items-start gap-4 lg:grid-cols-2"
-        onDragOver={(e) => {
-          e.preventDefault()
-          setDragOver(true)
-        }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={onDrop}
-      >
-        <section
-          className={cn(
-            'overflow-hidden rounded-2xl border bg-paper shadow-[0_18px_50px_-32px_rgba(28,25,22,0.55)] transition-colors',
-            dragOver ? 'border-cinnabar' : 'border-line/80',
-          )}
-        >
-          <div className="flex items-center justify-between border-b border-line/70 px-4 py-2.5">
-            <h2 className="text-sm font-medium">参考图</h2>
-            <span className="text-[11px] text-muted">拖放或点击更换</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => fileRef.current?.click()}
-            className="relative block w-full text-left"
-            style={{ aspectRatio: aspect }}
+      <div className="flex flex-1 flex-col items-center">
+        {phase !== 'draw' && (
+          <section
+            ref={frameRef}
+            data-testid="reference-frame"
+            className={cn(
+              'relative mx-auto overflow-hidden rounded-2xl border bg-paper shadow-[0_18px_50px_-32px_rgba(28,25,22,0.55)]',
+              dragOver ? 'border-cinnabar' : 'border-line/80',
+            )}
+            style={box}
           >
-            <canvas
-              ref={refCanvasRef}
-              data-testid="reference-canvas"
-              className={cn(
-                'absolute inset-0 h-full w-full',
-                processed ? 'block' : 'hidden',
-              )}
-            />
-            {!processed && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-[linear-gradient(180deg,#fffaf3,#f1eadc)] px-6 text-center">
+            {phase === 'lines' && lineUrl ? (
+              <img
+                src={lineUrl}
+                alt="参考图"
+                data-testid="line-preview"
+                className="absolute inset-0 h-full w-full object-contain"
+              />
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!processing) fileRef.current?.click()
+                }}
+                className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-[linear-gradient(180deg,#fffaf3,#f1eadc)] px-6 text-center"
+              >
                 <div className="rounded-full border border-dashed border-ink/20 px-3 py-1 text-[11px] text-muted">
                   PNG / JPG / WebP / SVG
                 </div>
                 <p className="text-sm font-medium text-ink">把图片拖到这里</p>
-                <p className="text-xs text-muted">
-                  也可以点「使用示例图」，看一笔怎么变成线
-                </p>
-              </div>
+                <p className="text-xs text-muted">也可以点「使用示例图」</p>
+              </button>
             )}
             {processing && (
               <div
@@ -349,49 +482,91 @@ function App() {
                 处理中…
               </div>
             )}
-          </button>
-        </section>
+          </section>
+        )}
 
-        <section className="overflow-hidden rounded-2xl border border-line/80 bg-paper shadow-[0_18px_50px_-32px_rgba(28,25,22,0.55)]">
-          <div className="flex items-center justify-between border-b border-line/70 px-4 py-2.5">
-            <h2 className="text-sm font-medium">临摹画布</h2>
-            <span className="text-[11px] text-muted">抬笔后变形成参考线</span>
-          </div>
-          <div className="relative w-full bg-[#fffaf3]" style={{ aspectRatio: aspect }}>
-            {!processed && (
-              <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-muted">
-                上传参考后，在线条附近画一条晃晃的线试试
+        {phase === 'draw' && (
+          <section className="flex w-full flex-col items-center gap-3">
+            <div className="flex w-full max-w-3xl items-center justify-between gap-3 px-1">
+              <h2 className="text-sm font-medium">临摹画布</h2>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  data-testid="show-original"
+                  disabled={!originalUrl}
+                  onClick={() => setModal('original')}
+                >
+                  展示原图
+                </Button>
+                <span ref={refBtnRef} className="inline-flex">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    data-testid="show-reference"
+                    disabled={!lineUrl}
+                    onClick={() => setModal('lines')}
+                  >
+                    展示参考图
+                  </Button>
+                </span>
               </div>
-            )}
-            <canvas
-              ref={resultRef}
-              data-testid="draw-canvas"
-              className="absolute inset-0 h-full w-full touch-none cursor-none"
-              style={{ touchAction: 'none' }}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={endPointer}
-              onPointerCancel={endPointer}
-              onPointerLeave={(e) => {
-                updateCursor(e, false)
-                endPointer(e)
-              }}
-              onContextMenu={(e) => e.preventDefault()}
-            />
-            <canvas
-              ref={rawRef}
-              className={cn(
-                'pointer-events-none absolute inset-0 h-full w-full',
-                showRaw ? 'opacity-100' : 'opacity-0',
-              )}
-            />
+            </div>
             <div
-              ref={cursorRef}
-              className="pointer-events-none absolute size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-cinnabar bg-cinnabar/40 opacity-0"
-            />
-          </div>
-        </section>
+              className={cn('relative mx-auto overflow-hidden rounded-2xl border border-line/80 bg-[#fffaf3] shadow-[0_18px_50px_-32px_rgba(28,25,22,0.55)]', flyer && 'pointer-events-none')}
+              style={box}
+            >
+              <canvas
+                ref={resultRef}
+                data-testid="draw-canvas"
+                className="absolute inset-0 h-full w-full touch-none cursor-none"
+                style={{ touchAction: 'none' }}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={endPointer}
+                onPointerCancel={endPointer}
+                onPointerLeave={(e) => {
+                  updateCursor(e, false)
+                  endPointer(e)
+                }}
+                onContextMenu={(e) => e.preventDefault()}
+              />
+              <canvas
+                ref={rawRef}
+                className={cn(
+                  'pointer-events-none absolute inset-0 h-full w-full',
+                  showRaw ? 'opacity-100' : 'opacity-0',
+                )}
+              />
+              <div
+                ref={cursorRef}
+                className="pointer-events-none absolute size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-cinnabar bg-cinnabar/40 opacity-0"
+              />
+            </div>
+          </section>
+        )}
       </div>
+
+      {flyer && flyerStyle && (
+        <img
+          src={flyer.src}
+          alt=""
+          data-testid="line-flyer"
+          className="pointer-events-none fixed z-30 rounded-2xl bg-paper object-contain shadow-[0_18px_50px_-28px_rgba(28,25,22,0.55)]"
+          style={flyerStyle}
+          onTransitionEnd={(event) => {
+            if (event.propertyName !== 'transform') return
+            setFlyer((current) => (current?.run ? { ...current, fading: true } : current))
+          }}
+        />
+      )}
+
+      {modal === 'original' && originalUrl && (
+        <ImageModal title="原图" src={originalUrl} onClose={closeModal} />
+      )}
+      {modal === 'lines' && lineUrl && (
+        <ImageModal title="参考图" src={lineUrl} onClose={closeModal} />
+      )}
 
       <footer className="pb-2 text-center text-[11px] text-muted">
         全部在浏览器本地完成，图片不会上传到服务器。
