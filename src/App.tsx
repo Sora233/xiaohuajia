@@ -34,13 +34,11 @@ function App() {
   const [processing, setProcessing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [dragOver, setDragOver] = useState(false)
-  const [brushSize, setBrushSize] = useState(36)
   const [detail, setDetail] = useState(62)
   const [colorMode, setColorMode] = useState(false)
   const [showRaw, setShowRaw] = useState(false)
   const [canUndo, setCanUndo] = useState(false)
   const [hint, setHint] = useState('先放一张参考图，再顺着线条的大致方向画')
-  const brushRef = useRef(brushSize)
   const colorRef = useRef(colorMode)
   const ingestGen = useRef(0)
 
@@ -63,7 +61,6 @@ function App() {
     if (reset || painter.width !== image.width || painter.height !== image.height) {
       painter.resize(image.width, image.height)
     }
-    painter.setSnapRadius(brushRef.current)
     painter.setDocument({
       contours: image.contours,
       index: image.index,
@@ -163,11 +160,6 @@ function App() {
   }, [colorMode])
 
   useEffect(() => {
-    brushRef.current = brushSize
-    painterRef.current.setSnapRadius(brushSize)
-  }, [brushSize])
-
-  useEffect(() => {
     const img = imageRef.current
     if (!img) return
     const handle = window.setTimeout(() => {
@@ -193,15 +185,11 @@ function App() {
       const canvas = resultRef.current
       if (!el || !canvas) return
       const rect = canvas.getBoundingClientRect()
-      const scale = rect.width / canvas.width
-      const r = brushSize * scale
-      el.style.width = `${r * 2}px`
-      el.style.height = `${r * 2}px`
       el.style.left = `${event.clientX - rect.left}px`
       el.style.top = `${event.clientY - rect.top}px`
       el.style.opacity = visible ? '1' : '0'
     },
-    [brushSize],
+    [],
   )
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -210,7 +198,6 @@ function App() {
     event.currentTarget.setPointerCapture(event.pointerId)
     drawingRef.current = true
     const { x, y } = pointerToCanvas(event, event.currentTarget)
-    painterRef.current.setSnapRadius(brushSize)
     painterRef.current.beginStroke(x, y)
     updateCursor(event, true)
   }
@@ -273,7 +260,6 @@ function App() {
         hasImage={Boolean(processed)}
         canUndo={canUndo}
         processing={processing}
-        brushSize={brushSize}
         detail={detail}
         colorMode={colorMode}
         showRaw={showRaw}
@@ -282,7 +268,6 @@ function App() {
         onSample={() => {
           void loadFromSrc(SAMPLE_IMAGE_SRC, true)
         }}
-        onBrushSize={setBrushSize}
         onDetail={setDetail}
         onColorMode={setColorMode}
         onShowRaw={setShowRaw}
@@ -402,7 +387,7 @@ function App() {
             />
             <div
               ref={cursorRef}
-              className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-cinnabar/70 bg-cinnabar/10 opacity-0"
+              className="pointer-events-none absolute size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-cinnabar bg-cinnabar/40 opacity-0"
             />
           </div>
         </section>

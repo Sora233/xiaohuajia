@@ -17,14 +17,12 @@ type ToolbarProps = {
   hasImage: boolean
   canUndo: boolean
   processing: boolean
-  brushSize: number
   detail: number
   colorMode: boolean
   showRaw: boolean
   onUploadClick: () => void
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void
   onSample: () => void
-  onBrushSize: (value: number) => void
   onDetail: (value: number) => void
   onColorMode: (value: boolean) => void
   onShowRaw: (value: boolean) => void
@@ -38,14 +36,12 @@ export function Toolbar({
   hasImage,
   canUndo,
   processing,
-  brushSize,
   detail,
   colorMode,
   showRaw,
   onUploadClick,
   onFileChange,
   onSample,
-  onBrushSize,
   onDetail,
   onColorMode,
   onShowRaw,
@@ -109,23 +105,7 @@ export function Toolbar({
         </div>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <div className="space-y-2 rounded-xl bg-paper-2/70 px-3 py-2.5">
-          <div className="flex items-center justify-between">
-            <Label htmlFor="brush">吸附距离</Label>
-            <span className="text-xs tabular-nums text-muted">{brushSize}px</span>
-          </div>
-          <Slider
-            id="brush"
-            min={8}
-            max={80}
-            step={1}
-            value={[brushSize]}
-            onValueChange={(v) => onBrushSize(v[0] ?? brushSize)}
-            disabled={!hasImage}
-          />
-        </div>
-
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         <div className="space-y-2 rounded-xl bg-paper-2/70 px-3 py-2.5">
           <div className="flex items-center justify-between">
             <Label htmlFor="detail">线条细节</Label>
