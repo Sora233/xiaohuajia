@@ -1,5 +1,5 @@
 import { buildSpatialIndex, takeTraceTimings, traceContours } from '@/lib/contours'
-import { runExtraction } from '@/lib/extract'
+import { extractMaskFromRgba, runExtraction } from '@/lib/extract'
 import { matchFinishedStroke } from '@/lib/match-stroke'
 import { arcLength, resampleSpacing } from '@/lib/polyline'
 
@@ -597,6 +597,142 @@ function lengthsOf(contours: Array<{ points: { x: number; y: number }[] }>) {
   console.log('平行线', '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','))
   const longs = lens.filter((n) => n > 80)
   assert(longs.length >= 2, `16px 平行线被并成了一条：${lens.map((n) => Math.round(n)).join(',')}`)
+}
+
+function paint(
+  data: Uint8ClampedArray,
+  width: number,
+  x: number,
+  y: number,
+  rgb: readonly [number, number, number],
+) {
+  if (x < 0 || y < 0 || x >= width) return
+  const i = (y * width + x) * 4
+  data[i] = rgb[0]
+  data[i + 1] = rgb[1]
+  data[i + 2] = rgb[2]
+  data[i + 3] = 255
+}
+
+function nearestContour(
+  contours: Array<{ points: { x: number; y: number }[] }>,
+  x: number,
+  y: number,
+) {
+  let best = Infinity
+  for (const c of contours) {
+    for (const p of c.points) {
+      const d = Math.hypot(p.x - x, p.y - y)
+      if (d < best) best = d
+    }
+  }
+  return best
+}
+
+// 黑白细线仍按墨迹提，不走彩色局部对比
+{
+  const W = 80
+  const H = 40
+  const data = paper(W, H)
+  for (let x = 6; x <= 72; x++) inkAt(data, W, x, 18)
+  const mask = extractMaskFromRgba(data, W, H, 62)
+  assert(mask.lineArt, '黑白线稿被当成了彩色图')
+}
+
+// 黄底上的色块：轮廓贴着边界，不能从色块中间穿过去
+{
+  const W = 160
+  const H = 120
+  const data = paper(W, H)
+  const yellow: [number, number, number] = [252, 228, 86]
+  const brown: [number, number, number] = [138, 74, 42]
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) paint(data, W, x, y, yellow)
+  }
+  const cx = 80
+  const cy = 60
+  const radius = 28
+  for (let y = cy - radius; y <= cy + radius; y++) {
+    for (let x = cx - radius; x <= cx + radius; x++) {
+      if ((x - cx) ** 2 + (y - cy) ** 2 <= radius * radius) paint(data, W, x, y, brown)
+    }
+  }
+  const mask = extractMaskFromRgba(data, W, H, 62)
+  const { contours } = runExtraction(data, W, H, 62)
+  const lens = lengthsOf(contours)
+  const total = lens.reduce((s, n) => s + n, 0)
+  const mid = nearestContour(contours, cx, cy)
+  console.log('彩色色块', '线稿', mask.lineArt, '条数', contours.length, '长度', lens.map((n) => Math.round(n)).join(','), '中心距', mid.toFixed(1))
+  assert(!mask.lineArt, '彩色色块被当成了黑白线稿')
+  assert(mid > 16, `轮廓穿过了色块中心，距离 ${mid.toFixed(1)}`)
+  assert(total > 120 && total < 420, `色块边界长度不对：${total.toFixed(0)}`)
+}
+
+// 两条隔开的色线各留一条中心线
+{
+  const W = 160
+  const H = 70
+  const data = paper(W, H)
+  const red: [number, number, number] = [214, 42, 58]
+  const blue: [number, number, number] = [36, 78, 214]
+  for (let x = 12; x <= 148; x++) {
+    for (let t = 0; t < 3; t++) {
+      paint(data, W, x, 22 + t, red)
+      paint(data, W, x, 46 + t, blue)
+    }
+  }
+  const { contours } = runExtraction(data, W, H, 62)
+  const longs = contours.filter((c) => arcLength(c.points) > 80)
+  const means = longs.map((c) => c.points.reduce((s, p) => s + p.y, 0) / c.points.length)
+  console.log(
+    '彩色平行线',
+    '条数',
+    contours.length,
+    '长线',
+    longs.length,
+    '中线',
+    means.map((n) => n.toFixed(1)).join(','),
+  )
+  assert(longs.length === 2, `彩色平行线不是两条：${longs.length}`)
+  const ys = means.slice().sort((a, b) => a - b)
+  assert(Math.abs(ys[0] - 23) < 4 && Math.abs(ys[1] - 47) < 4, `彩色线没有落在笔画上：${ys.join(',')}`)
+}
+
+// 深色块内部的黑线要留下来，不能被整块色填掉
+{
+  const W = 200
+  const H = 140
+  const data = paper(W, H)
+  const yellow: [number, number, number] = [250, 226, 92]
+  const brown: [number, number, number] = [126, 68, 40]
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) paint(data, W, x, y, yellow)
+  }
+  for (let y = 16; y <= 124; y++) {
+    for (let x = 16; x <= 184; x++) paint(data, W, x, y, brown)
+  }
+  for (let x = 36; x <= 164; x++) {
+    for (let t = 0; t < 3; t++) inkAt(data, W, x, 70 + t)
+  }
+  const { contours } = runExtraction(data, W, H, 62)
+  const onStroke = contours.filter((c) => {
+    const near = c.points.filter((p) => Math.abs(p.y - 71) < 4).length
+    return near > 12 && arcLength(c.points) > 70
+  })
+  const pocket = nearestContour(contours, 48, 40)
+  console.log(
+    '色块内描边',
+    '条数',
+    contours.length,
+    '贴线',
+    onStroke.length,
+    '空腔距',
+    pocket.toFixed(1),
+    '长度',
+    lengthsOf(contours).map((n) => Math.round(n)).join(','),
+  )
+  assert(onStroke.length >= 1, '色块内部的黑线丢了')
+  assert(pocket > 12, `色块内部被骨架穿过：${pocket.toFixed(1)}`)
 }
 
 console.log('contour self-check ok')
