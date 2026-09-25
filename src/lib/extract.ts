@@ -16,7 +16,7 @@ export type ExtractionResult = {
   timings: ExtractionTimings
 }
 
-/** 灰度拉对比、阈值取墨，再沿墨块边界描线。不碰 DOM，可在 Worker 里跑。 */
+/** 深色块的外轮廓，再加上局部明暗和色差里的线。不碰 DOM，可在 Worker 里跑。 */
 export function runExtraction(
   rgba: Uint8ClampedArray,
   width: number,

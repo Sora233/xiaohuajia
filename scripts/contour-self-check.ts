@@ -695,7 +695,7 @@ function nearestContour(
   assert(Math.abs(ys[0] - 23) < 4 && Math.abs(ys[1] - 47) < 4, `彩色线没有落在笔画上：${ys.join(',')}`)
 }
 
-// 深色块收成外轮廓。块内部更深的笔划和块是同一块墨，不再单独抽一条
+// 深色块留外轮廓，块里更深的笔划单独留下，平涂的中间不被穿过
 {
   const W = 200
   const H = 140
@@ -712,18 +712,24 @@ function nearestContour(
     for (let t = 0; t < 3; t++) inkAt(data, W, x, 70 + t)
   }
   const { contours } = runExtraction(data, W, H, 62)
+  const onStroke = contours.filter((c) => {
+    const near = c.points.filter((p) => Math.abs(p.y - 71) < 5).length
+    return near > 12 && arcLength(c.points) > 70
+  })
   const pocket = nearestContour(contours, 48, 40)
   const lens = lengthsOf(contours)
   console.log(
-    '色块外轮廓',
+    '色块内描边',
     '条数',
     contours.length,
+    '贴线',
+    onStroke.length,
     '空腔距',
     pocket.toFixed(1),
     '长度',
     lens.map((n) => Math.round(n)).join(','),
   )
-  assert(contours.length <= 3, `色块被拆碎了：${contours.length}`)
+  assert(onStroke.length >= 1, '色块内部的黑线丢了')
   assert(pocket > 12, `色块内部被线穿过：${pocket.toFixed(1)}`)
   assert(lens[0] > 300, `色块外轮廓太短：${lens[0]?.toFixed(0)}`)
 }
