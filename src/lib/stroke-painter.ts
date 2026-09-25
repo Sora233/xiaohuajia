@@ -49,7 +49,7 @@ export class StrokePainter {
   private colorData: ImageData | null = null
   private strokes: StrokeRecord[] = []
   private liveRaw: Point[] = []
-  private colorMode = false
+  private colorMode = true
   private snapRadius = 36
   /** 每次换轮廓就加一，避免旧下标误占新线 */
   private epoch = 0
