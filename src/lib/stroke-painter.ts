@@ -10,6 +10,22 @@ const FADE_MS = 460
 
 type Phase = 'hold' | 'morph' | 'fade' | 'done'
 
+export type ReplayPiece = {
+  source: Point[]
+  target: Point[]
+}
+
+export type ReplayStroke = {
+  width: number
+  pieces: ReplayPiece[]
+}
+
+export type ReplayMark = {
+  lines: Point[][]
+  width: number
+  hints?: Point[][]
+}
+
 type StrokeRecord = {
   raw: Point[]
   pieces: StrokeMatch[]
@@ -203,6 +219,40 @@ export class StrokePainter {
   exportPng(): string {
     if (!this.result) return ''
     return this.result.toDataURL('image/png')
+  }
+
+  /** 至少有一笔对上了参考轮廓。对不上、只会淡出的笔不算。 */
+  hasReplay() {
+    return this.strokes.some((stroke) => stroke.pieces.length > 0)
+  }
+
+  /**
+   * 按作画顺序交出有效笔画的源和目标。
+   * 拷贝顶点，导出过程中撤销或清空也不会把这一帧改掉。
+   */
+  replayStrokes(): ReplayStroke[] {
+    const out: ReplayStroke[] = []
+    for (const stroke of this.strokes) {
+      if (stroke.pieces.length === 0) continue
+      out.push({
+        width: stroke.width,
+        pieces: stroke.pieces.map((piece) => ({
+          source: piece.source.map((p) => ({ x: p.x, y: p.y })),
+          target: piece.target.map((p) => ({ x: p.x, y: p.y })),
+        })),
+      })
+    }
+    return out
+  }
+
+  /** 把一组笔画画进任意画布，不碰正在作画的那张。 */
+  paintReplay(ctx: CanvasRenderingContext2D, marks: ReplayMark[]) {
+    for (const mark of marks) {
+      if (mark.hints) {
+        for (const hint of mark.hints) this.paintTargetHint(ctx, hint, mark.width)
+      }
+      for (const line of mark.lines) this.paintStroke(ctx, line, mark.width, this.colorMode)
+    }
   }
 
   private ensureAnim() {

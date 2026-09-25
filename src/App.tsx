@@ -19,6 +19,7 @@ import {
   ProcessingCancelled,
   type ProcessedImage,
 } from '@/lib/image-process'
+import { buildReplayGif } from '@/lib/export-gif'
 import { renderLineSheet } from '@/lib/line-preview'
 import { SAMPLE_IMAGE_SRC } from '@/lib/sample'
 import { pointerToCanvas, StrokePainter } from '@/lib/stroke-painter'
@@ -57,6 +58,15 @@ function prefersReducedMotion() {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches
 }
 
+/** 手机和平板才出分享。电脑上没有微信、QQ 的系统分享入口。 */
+function isMobileDevice() {
+  const ua = navigator.userAgent
+  if (/Android|iPhone|iPad|iPod|Mobile/i.test(ua)) return true
+  return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1
+}
+
+const GIF_FILE_NAME = '小画家模拟器.gif'
+
 function App() {
   const fileRef = useRef<HTMLInputElement>(null)
   const resultRef = useRef<HTMLCanvasElement>(null)
@@ -83,6 +93,10 @@ function App() {
   const [colorMode, setColorMode] = useState(true)
   const [showRaw, setShowRaw] = useState(false)
   const [canUndo, setCanUndo] = useState(false)
+  const [canExportGif, setCanExportGif] = useState(false)
+  const [exportingGif, setExportingGif] = useState(false)
+  const [gifPreview, setGifPreview] = useState<{ url: string; blob: Blob } | null>(null)
+  const gifPreviewRef = useRef<{ url: string; blob: Blob } | null>(null)
   const [hint, setHint] = useState('先放一张图，再顺着线条画')
   const [phase, setPhase] = useState<Phase>('pick')
   const [lineUrl, setLineUrl] = useState('')
@@ -122,6 +136,7 @@ function App() {
     })
     painter.setColorMode(colorRef.current)
     setCanUndo(painter.canUndo())
+    setCanExportGif(painter.hasReplay())
   }, [])
 
   const ingestImage = useCallback(
@@ -352,15 +367,18 @@ function App() {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (modal) return
+      if (modal || exportingGif) return
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
         event.preventDefault()
-        if (painterRef.current.undo()) setCanUndo(painterRef.current.canUndo())
+        if (painterRef.current.undo()) {
+          setCanUndo(painterRef.current.canUndo())
+          setCanExportGif(painterRef.current.hasReplay())
+        }
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [modal])
+  }, [modal, exportingGif])
 
   const updateCursor = useCallback(
     (event: ReactPointerEvent<HTMLCanvasElement>, visible: boolean) => {
@@ -376,7 +394,7 @@ function App() {
   )
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!processed || processing || flyer) return
+    if (!processed || processing || flyer || exportingGif) return
     event.preventDefault()
     event.currentTarget.setPointerCapture(event.pointerId)
     drawingRef.current = true
@@ -386,6 +404,10 @@ function App() {
   }
 
   const onPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (exportingGif) {
+      updateCursor(event, false)
+      return
+    }
     updateCursor(event, true)
     if (!drawingRef.current) return
     const { x, y } = pointerToCanvas(event, event.currentTarget)
@@ -397,6 +419,7 @@ function App() {
     drawingRef.current = false
     painterRef.current.endStroke()
     setCanUndo(painterRef.current.canUndo())
+    setCanExportGif(painterRef.current.hasReplay())
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId)
     }
@@ -424,6 +447,53 @@ function App() {
   }
 
   const closeModal = useCallback(() => setModal(null), [])
+
+  const closeGifPreview = useCallback(() => {
+    const current = gifPreviewRef.current
+    if (current) URL.revokeObjectURL(current.url)
+    gifPreviewRef.current = null
+    setGifPreview(null)
+    setExportingGif(false)
+  }, [])
+
+  const saveGif = useCallback(() => {
+    const current = gifPreviewRef.current
+    if (!current) return
+    const a = document.createElement('a')
+    a.href = current.url
+    a.download = GIF_FILE_NAME
+    a.click()
+  }, [])
+
+  const shareGif = useCallback(async () => {
+    const current = gifPreviewRef.current
+    if (!current) return
+    const file = new File([current.blob], GIF_FILE_NAME, { type: 'image/gif' })
+    const payload = { files: [file], title: '小画家模拟器' }
+    try {
+      if (!navigator.share || (navigator.canShare && !navigator.canShare(payload))) return
+      await navigator.share(payload)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      setError(err instanceof Error ? err.message : '分享失败')
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!gifPreview) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeGifPreview()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [gifPreview, closeGifPreview])
+
+  useEffect(() => {
+    return () => {
+      const current = gifPreviewRef.current
+      if (current) URL.revokeObjectURL(current.url)
+    }
+  }, [])
 
   let flyerStyle: CSSProperties | undefined
   if (flyer) {
@@ -497,10 +567,12 @@ function App() {
         onUndo={() => {
           painterRef.current.undo()
           setCanUndo(painterRef.current.canUndo())
+          setCanExportGif(painterRef.current.hasReplay())
         }}
         onClear={() => {
           painterRef.current.clear()
           setCanUndo(painterRef.current.canUndo())
+          setCanExportGif(painterRef.current.hasReplay())
         }}
         onDownload={() => {
           const href = painterRef.current.exportPng()
@@ -509,6 +581,34 @@ function App() {
           a.href = href
           a.download = '小画家模拟器.png'
           a.click()
+        }}
+        canExportGif={canExportGif}
+        exportingGif={exportingGif}
+        onExportGif={() => {
+          if (exportingGif) return
+          if (drawingRef.current) {
+            drawingRef.current = false
+            painterRef.current.endStroke()
+            setCanUndo(painterRef.current.canUndo())
+            setCanExportGif(painterRef.current.hasReplay())
+          }
+          setModal(null)
+          setExportingGif(true)
+          void buildReplayGif(painterRef.current)
+            .then((blob) => {
+              if (!blob) {
+                setExportingGif(false)
+                return
+              }
+              const url = URL.createObjectURL(blob)
+              const next = { url, blob }
+              gifPreviewRef.current = next
+              setGifPreview(next)
+            })
+            .catch((err: unknown) => {
+              setExportingGif(false)
+              setError(err instanceof Error ? err.message : '导出失败')
+            })
         }}
       />
 
@@ -607,7 +707,10 @@ function App() {
               </div>
             </div>
             <div
-              className={cn('relative mx-auto overflow-hidden rounded-2xl border border-line/80 bg-[#fffaf3] shadow-[0_18px_50px_-32px_rgba(28,25,22,0.55)]', flyer && 'pointer-events-none')}
+              className={cn(
+                'relative mx-auto overflow-hidden rounded-2xl border border-line/80 bg-[#fffaf3] shadow-[0_18px_50px_-32px_rgba(28,25,22,0.55)]',
+                (flyer || exportingGif) && 'pointer-events-none',
+              )}
               style={box}
             >
               <canvas
@@ -640,6 +743,50 @@ function App() {
           </section>
         )}
       </div>
+
+      {exportingGif && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-ink/40 p-4 backdrop-blur-[1px]"
+          data-testid="export-mask"
+          role={gifPreview ? 'dialog' : 'status'}
+          aria-modal={gifPreview ? true : undefined}
+          aria-label={gifPreview ? '导出的 GIF' : undefined}
+          aria-live={gifPreview ? undefined : 'polite'}
+          onClick={() => {
+            if (gifPreview) closeGifPreview()
+          }}
+        >
+          {gifPreview ? (
+            <div
+              className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-line bg-paper shadow-[0_24px_80px_-28px_rgba(28,25,22,0.7)]"
+              data-testid="gif-preview"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="grid min-h-0 flex-1 place-items-center bg-[linear-gradient(180deg,#fffaf3,#f3eee4)] p-4">
+                <img
+                  src={gifPreview.url}
+                  alt=""
+                  className="max-h-[70vh] max-w-full object-contain"
+                />
+              </div>
+              <div className="flex items-center justify-center gap-2 border-t border-line/70 px-4 py-3">
+                <Button data-testid="gif-save" onClick={saveGif}>
+                  保存
+                </Button>
+                {isMobileDevice() && (
+                  <Button variant="outline" data-testid="gif-share" onClick={() => void shareGif()}>
+                    分享
+                  </Button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <p className="rounded-full border border-line/80 bg-paper px-4 py-2 text-sm text-ink shadow-[0_18px_50px_-28px_rgba(28,25,22,0.55)]">
+              正在导出
+            </p>
+          )}
+        </div>
+      )}
 
       {flyer && flyerStyle && lineUrl && (
         <img

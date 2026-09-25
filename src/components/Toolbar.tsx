@@ -1,6 +1,7 @@
 import {
   Download,
   Eraser,
+  Film,
   ImagePlus,
   RotateCcw,
   Sparkles,
@@ -25,6 +26,9 @@ type ToolbarProps = {
   onUndo: () => void
   onClear: () => void
   onDownload: () => void
+  canExportGif: boolean
+  exportingGif: boolean
+  onExportGif: () => void
 }
 
 export function Toolbar({
@@ -42,6 +46,9 @@ export function Toolbar({
   onUndo,
   onClear,
   onDownload,
+  canExportGif,
+  exportingGif,
+  onExportGif,
 }: ToolbarProps) {
   return (
     <div className="flex flex-col gap-3 rounded-2xl border border-line/80 bg-paper/90 p-3 shadow-[0_10px_40px_-24px_rgba(28,25,22,0.45)] backdrop-blur-sm md:p-4">
@@ -95,6 +102,16 @@ export function Toolbar({
           >
             <Download />
             下载 PNG
+          </Button>
+          <Button
+            size="sm"
+            variant="accent"
+            onClick={onExportGif}
+            disabled={!canExportGif || exportingGif}
+            data-testid="export-gif"
+          >
+            <Film />
+            {exportingGif ? '导出中' : '导出GIF'}
           </Button>
         </div>
       </div>
