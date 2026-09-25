@@ -259,6 +259,22 @@ export class StrokePainter {
     this.redraw()
   }
 
+  /** 停掉还没开始的线。正在描的这一笔补完，避免留下半截。 */
+  stopAutoDraw() {
+    if (!this.autoOnDone && this.autoQueue.length === 0) return
+    for (const stroke of this.strokes) {
+      if (stroke.phase !== 'trace') continue
+      stroke.phase = 'done'
+      stroke.elapsed = stroke.duration
+      stroke.display = [stroke.raw.map((point) => ({ x: point.x, y: point.y }))]
+    }
+    if (!this.strokes.some((stroke) => stroke.phase !== 'done') && this.liveRaw.length === 0) {
+      this.stopAnim()
+    }
+    this.redraw()
+    this.finishAuto(true)
+  }
+
   /** 按长到短、外到内的综合顺序，把还没画过的轮廓描出来。 */
   startAutoDraw(onDone: () => void): boolean {
     if (this.autoOnDone || this.autoQueue.length > 0) return false

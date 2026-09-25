@@ -714,10 +714,14 @@ function App() {
                 <Button
                   size="sm"
                   data-testid="auto-draw"
-                  disabled={!processed || processing || exportingGif || autoDrawing}
+                  disabled={!processed || processing || exportingGif}
                   className="border-transparent bg-[#2f8f4e] text-white hover:bg-[#257a42]"
                   onClick={() => {
-                    if (autoDrawing || exportingGif) return
+                    if (exportingGif) return
+                    if (autoDrawing) {
+                      painterRef.current.stopAutoDraw()
+                      return
+                    }
                     setAutoDrawing(true)
                     const started = painterRef.current.startAutoDraw(() => {
                       setAutoDrawing(false)
@@ -727,7 +731,7 @@ function App() {
                     if (!started) setAutoDrawing(false)
                   }}
                 >
-                  自动完成
+                  {autoDrawing ? '停止' : '自动完成'}
                 </Button>
                 <Button
                   size="sm"
