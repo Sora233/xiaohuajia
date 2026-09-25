@@ -241,6 +241,30 @@ function App() {
   )
 
   useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      const target = event.target
+      if (
+        target instanceof HTMLElement &&
+        target.closest('input, textarea, [contenteditable="true"]')
+      ) {
+        return
+      }
+      const list = event.clipboardData?.items
+      if (!list) return
+      for (const item of list) {
+        if (!item.type.startsWith('image/')) continue
+        const file = item.getAsFile()
+        if (!file) continue
+        event.preventDefault()
+        void loadFile(file)
+        return
+      }
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [loadFile])
+
+  useEffect(() => {
     const painter = painterRef.current
     return () => {
       painter.dispose()
