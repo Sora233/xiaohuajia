@@ -50,7 +50,7 @@ export class StrokePainter {
   private strokes: StrokeRecord[] = []
   private liveRaw: Point[] = []
   private colorMode = false
-  private snapRadius = 28
+  private snapRadius = 36
   /** 每次换轮廓就加一，避免旧下标误占新线 */
   private epoch = 0
   /** 仅供本地核对最近一笔匹配了几段目标线 */
