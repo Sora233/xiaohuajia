@@ -33,7 +33,6 @@ type Phase = 'pick' | 'lines' | 'draw'
 type Box = { left: number; top: number; width: number; height: number }
 type ModalKind = 'original' | 'lines'
 type Flyer = {
-  src: string
   from: Box
   to: Box | null
   run: boolean
@@ -66,6 +65,8 @@ function App() {
   const resetDrawRef = useRef(false)
   const colorRef = useRef(true)
   const ingestGen = useRef(0)
+  const lineUrlRef = useRef('')
+  const processedRef = useRef<ProcessedImage | null>(null)
 
   const [processed, setProcessed] = useState<ProcessedImage | null>(null)
   const [processing, setProcessing] = useState(false)
@@ -80,6 +81,18 @@ function App() {
   const [originalUrl, setOriginalUrl] = useState('')
   const [modal, setModal] = useState<ModalKind | null>(null)
   const [flyer, setFlyer] = useState<Flyer | null>(null)
+
+  const publishLineSheet = useCallback((image: ProcessedImage, colorize: boolean) => {
+    const sheet = renderLineSheet(
+      image.contours,
+      image.width,
+      image.height,
+      colorize ? image.color : null,
+    )
+    const url = sheet.toDataURL('image/png')
+    lineUrlRef.current = url
+    setLineUrl(url)
+  }, [])
 
   const bindPainter = useCallback((image: ProcessedImage, reset: boolean) => {
     const painter = painterRef.current
@@ -113,12 +126,12 @@ function App() {
         if (gen !== ingestGen.current) return
         const next = await processSource(img, LINE_DETAIL)
         if (gen !== ingestGen.current) return
-        const sheet = renderLineSheet(next.contours, next.width, next.height)
         imageRef.current = img
         resetDrawRef.current = resetDrawing
+        processedRef.current = next
         setProcessed(next)
         setOriginalUrl(next.color.toDataURL('image/png'))
-        setLineUrl(sheet.toDataURL('image/png'))
+        publishLineSheet(next, colorRef.current)
         const lens = next.contours
           .map((c) => c.points.length)
           .sort((a, b) => b - a)
@@ -146,7 +159,7 @@ function App() {
         if (gen === ingestGen.current) setProcessing(false)
       }
     },
-    [],
+    [publishLineSheet],
   )
 
   const loadFromSrc = useCallback(
@@ -202,16 +215,16 @@ function App() {
   }, [phase, processed, bindPainter])
 
   useEffect(() => {
-    if (phase !== 'lines' || !lineUrl) return
+    if (phase !== 'lines') return
     const reduced = prefersReducedMotion()
+    // 线稿地址变了只换图，不重新计时，避免切换上色把预览再停一遍
     const timer = window.setTimeout(() => {
       const frame = frameRef.current?.getBoundingClientRect()
-      if (!frame || reduced) {
+      if (!frame || reduced || !lineUrlRef.current) {
         setPhase('draw')
         return
       }
       setFlyer({
-        src: lineUrl,
         from: {
           left: frame.left,
           top: frame.top,
@@ -225,7 +238,7 @@ function App() {
       setPhase('draw')
     }, reduced ? 400 : LINE_HOLD_MS)
     return () => window.clearTimeout(timer)
-  }, [phase, lineUrl])
+  }, [phase])
 
   useLayoutEffect(() => {
     if (!flyer || flyer.to || phase !== 'draw') return
@@ -413,7 +426,12 @@ function App() {
         onSample={() => {
           void loadFromSrc(SAMPLE_IMAGE_SRC, true)
         }}
-        onColorMode={setColorMode}
+        onColorMode={(on) => {
+          colorRef.current = on
+          setColorMode(on)
+          const image = processedRef.current
+          if (image) publishLineSheet(image, on)
+        }}
         onShowRaw={setShowRaw}
         onUndo={() => {
           painterRef.current.undo()
@@ -547,9 +565,9 @@ function App() {
         )}
       </div>
 
-      {flyer && flyerStyle && (
+      {flyer && flyerStyle && lineUrl && (
         <img
-          src={flyer.src}
+          src={lineUrl}
           alt=""
           data-testid="line-flyer"
           className="pointer-events-none fixed z-30 rounded-2xl bg-paper object-contain shadow-[0_18px_50px_-28px_rgba(28,25,22,0.55)]"
