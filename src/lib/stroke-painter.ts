@@ -1,14 +1,58 @@
 import type { Contour, SpatialIndex } from '@/lib/contours'
 import { INK, PAPER, sampleInkColor } from '@/lib/ink-color'
 import { matchFinishedStroke, type StrokeMatch } from '@/lib/match-stroke'
-import { easeInOutCubic, morphPolyline, type Point } from '@/lib/polyline'
+import { arcLength, easeInOutCubic, morphPolyline, slicePolylineByFraction, type Point } from '@/lib/polyline'
 
 /** 先停一下让人看清自己的笔，再在大约 0.8s 内变过去 */
 const HOLD_MS = 200
 const MORPH_MS = 800
 const FADE_MS = 460
 
-type Phase = 'hold' | 'morph' | 'fade' | 'done'
+type Phase = 'hold' | 'morph' | 'fade' | 'trace' | 'done'
+
+/** 自动完成整段大约这么久，长线多占一点时间。 */
+const AUTO_MS = 7000
+
+/**
+ * 长线优先，同时靠外的线优先。两项都归一化后相加，避免只按其中一个排。
+ * 靠外看的是离画面重心最远的点，这样绕着主体的外轮廓会排在五官前面。
+ */
+function orderContours(contours: Contour[]): Contour[] {
+  const usable = contours.filter((contour) => contour.points.length >= 2)
+  if (usable.length === 0) return []
+  let sx = 0
+  let sy = 0
+  let count = 0
+  const lengths = usable.map((contour) => arcLength(contour.points))
+  for (const contour of usable) {
+    for (const point of contour.points) {
+      sx += point.x
+      sy += point.y
+      count++
+    }
+  }
+  const cx = count ? sx / count : 0
+  const cy = count ? sy / count : 0
+  let maxLen = 1
+  let maxReach = 1
+  const reaches = usable.map((contour, index) => {
+    let far = 0
+    for (const point of contour.points) {
+      const dist = Math.hypot(point.x - cx, point.y - cy)
+      if (dist > far) far = dist
+    }
+    if (lengths[index] > maxLen) maxLen = lengths[index]
+    if (far > maxReach) maxReach = far
+    return far
+  })
+  return usable
+    .map((contour, index) => ({
+      contour,
+      score: lengths[index] / maxLen + reaches[index] / maxReach,
+    }))
+    .sort((a, b) => b.score - a.score)
+    .map((item) => item.contour)
+}
 
 export type ReplayPiece = {
   source: Point[]
@@ -71,6 +115,9 @@ export class StrokePainter {
   debugMatchCount = 0
   private animFrame = 0
   private lastNow = 0
+  private autoQueue: Contour[] = []
+  private autoDurations: number[] = []
+  private autoOnDone: (() => void) | null = null
   width = 0
   height = 0
 
@@ -98,6 +145,7 @@ export class StrokePainter {
     }
     this.strokes = []
     this.liveRaw = []
+    this.finishAuto(true)
     this.stopAnim()
     this.redraw()
   }
@@ -202,16 +250,47 @@ export class StrokePainter {
   }
 
   clear() {
-    if (this.strokes.length === 0 && this.liveRaw.length === 0) return
+    const auto = this.autoQueue.length > 0 || this.autoOnDone !== null
+    if (this.strokes.length === 0 && this.liveRaw.length === 0 && !auto) return
     this.strokes = []
     this.liveRaw = []
+    this.finishAuto(true)
     this.stopAnim()
     this.redraw()
+  }
+
+  /** 按长到短、外到内的综合顺序，把还没画过的轮廓描出来。 */
+  startAutoDraw(onDone: () => void): boolean {
+    if (this.autoOnDone || this.autoQueue.length > 0) return false
+    const taken = new Set(
+      this.strokes
+        .filter((stroke) => stroke.epoch === this.epoch)
+        .flatMap((stroke) => stroke.pieces.map((piece) => piece.contourId)),
+    )
+    const ordered = orderContours(this.contours).filter((contour) => {
+      if (taken.has(contour.id)) return false
+      return contour.points.length >= 2 && arcLength(contour.points) >= 2
+    })
+    if (ordered.length === 0) return false
+    const lengths = ordered.map((contour) => arcLength(contour.points))
+    const sum = lengths.reduce((total, len) => total + len, 0) || 1
+    let durations = lengths.map((len) => Math.max(16, (AUTO_MS * len) / sum))
+    const planned = durations.reduce((total, len) => total + len, 0)
+    if (planned > AUTO_MS) {
+      const scale = AUTO_MS / planned
+      durations = durations.map((len) => Math.max(12, len * scale))
+    }
+    this.autoQueue = ordered
+    this.autoDurations = durations
+    this.autoOnDone = onDone
+    this.pumpAuto()
+    return this.autoOnDone !== null
   }
 
   resetAll() {
     this.strokes = []
     this.liveRaw = []
+    this.finishAuto(true)
     this.stopAnim()
     this.redraw()
   }
@@ -255,6 +334,46 @@ export class StrokePainter {
     }
   }
 
+  private finishAuto(notify: boolean) {
+    this.autoQueue = []
+    this.autoDurations = []
+    const done = this.autoOnDone
+    this.autoOnDone = null
+    if (notify) done?.()
+  }
+
+  private pumpAuto() {
+    const width = inkWidth(this.snapRadius)
+    while (this.autoQueue.length > 0) {
+      const contour = this.autoQueue.shift()
+      const duration = this.autoDurations.shift() ?? 40
+      if (!contour || contour.points.length < 2) continue
+      const pts = contour.points.map((point) => ({ x: point.x, y: point.y }))
+      this.strokes.push({
+        raw: pts,
+        pieces: [
+          {
+            source: pts,
+            target: pts,
+            contourId: contour.id,
+            spans: [[0, pts.length - 1]],
+          },
+        ],
+        display: [[{ x: pts[0].x, y: pts[0].y }]],
+        width,
+        opacity: 1,
+        phase: 'trace',
+        elapsed: 0,
+        holdMs: 0,
+        duration,
+        epoch: this.epoch,
+      })
+      this.ensureAnim()
+      return
+    }
+    this.finishAuto(true)
+  }
+
   private ensureAnim() {
     if (this.animFrame) return
     this.lastNow = 0
@@ -271,6 +390,7 @@ export class StrokePainter {
     const dt = this.lastNow ? Math.min(40, now - this.lastNow) : 16
     this.lastNow = now
     let busy = false
+    let pump = false
     for (const s of this.strokes) {
       if (s.phase === 'done') continue
       busy = true
@@ -289,6 +409,14 @@ export class StrokePainter {
           s.phase = 'done'
           s.display = s.pieces.map((p) => p.target.map((pt) => ({ ...pt })))
         }
+      } else if (s.phase === 'trace') {
+        const t = Math.min(1, s.elapsed / Math.max(1, s.duration))
+        s.display = [slicePolylineByFraction(s.raw, 0, t)]
+        if (t >= 1) {
+          s.phase = 'done'
+          s.display = [s.raw.map((point) => ({ x: point.x, y: point.y }))]
+          pump = true
+        }
       } else if (s.phase === 'fade') {
         const t = Math.min(1, s.elapsed / s.duration)
         s.opacity = 1 - easeInOutCubic(t)
@@ -299,6 +427,8 @@ export class StrokePainter {
         }
       }
     }
+    if (pump) this.pumpAuto()
+    if (this.autoQueue.length > 0 || this.strokes.some((s) => s.phase === 'trace')) busy = true
     this.redraw()
     if (busy) this.animFrame = requestAnimationFrame(this.tick)
     else {

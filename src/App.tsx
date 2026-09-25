@@ -95,6 +95,7 @@ function App() {
   const [canUndo, setCanUndo] = useState(false)
   const [canExportGif, setCanExportGif] = useState(false)
   const [exportingGif, setExportingGif] = useState(false)
+  const [autoDrawing, setAutoDrawing] = useState(false)
   const [gifPreview, setGifPreview] = useState<{ url: string; blob: Blob } | null>(null)
   const gifPreviewRef = useRef<{ url: string; blob: Blob } | null>(null)
   const [hint, setHint] = useState('先放一张图，再顺着线条画')
@@ -367,7 +368,7 @@ function App() {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (modal || exportingGif) return
+      if (modal || exportingGif || autoDrawing) return
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
         event.preventDefault()
         if (painterRef.current.undo()) {
@@ -378,7 +379,7 @@ function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [modal, exportingGif])
+  }, [modal, exportingGif, autoDrawing])
 
   const updateCursor = useCallback(
     (event: ReactPointerEvent<HTMLCanvasElement>, visible: boolean) => {
@@ -394,7 +395,7 @@ function App() {
   )
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!processed || processing || flyer || exportingGif) return
+    if (!processed || processing || flyer || exportingGif || autoDrawing) return
     event.preventDefault()
     event.currentTarget.setPointerCapture(event.pointerId)
     drawingRef.current = true
@@ -404,7 +405,7 @@ function App() {
   }
 
   const onPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (exportingGif) {
+    if (exportingGif || autoDrawing) {
       updateCursor(event, false)
       return
     }
@@ -548,7 +549,7 @@ function App() {
       <Toolbar
         fileRef={fileRef}
         hasImage={Boolean(processed)}
-        canUndo={canUndo}
+        canUndo={canUndo && !autoDrawing}
         processing={processing}
         colorMode={colorMode}
         showRaw={showRaw}
@@ -565,12 +566,14 @@ function App() {
         }}
         onShowRaw={setShowRaw}
         onUndo={() => {
+          if (autoDrawing) return
           painterRef.current.undo()
           setCanUndo(painterRef.current.canUndo())
           setCanExportGif(painterRef.current.hasReplay())
         }}
         onClear={() => {
           painterRef.current.clear()
+          setAutoDrawing(false)
           setCanUndo(painterRef.current.canUndo())
           setCanExportGif(painterRef.current.hasReplay())
         }}
@@ -582,7 +585,7 @@ function App() {
           a.download = '小画家模拟器.png'
           a.click()
         }}
-        canExportGif={canExportGif}
+        canExportGif={canExportGif && !autoDrawing}
         exportingGif={exportingGif}
         onExportGif={() => {
           if (exportingGif) return
@@ -686,6 +689,24 @@ function App() {
               <div className="flex flex-wrap items-center gap-2">
                 <Button
                   size="sm"
+                  data-testid="auto-draw"
+                  disabled={!processed || processing || exportingGif || autoDrawing}
+                  className="border-transparent bg-[#2f8f4e] text-white hover:bg-[#257a42]"
+                  onClick={() => {
+                    if (autoDrawing || exportingGif) return
+                    setAutoDrawing(true)
+                    const started = painterRef.current.startAutoDraw(() => {
+                      setAutoDrawing(false)
+                      setCanUndo(painterRef.current.canUndo())
+                      setCanExportGif(painterRef.current.hasReplay())
+                    })
+                    if (!started) setAutoDrawing(false)
+                  }}
+                >
+                  自动完成
+                </Button>
+                <Button
+                  size="sm"
                   variant="outline"
                   data-testid="show-original"
                   disabled={!originalUrl}
@@ -709,7 +730,7 @@ function App() {
             <div
               className={cn(
                 'relative mx-auto overflow-hidden rounded-2xl border border-line/80 bg-[#fffaf3] shadow-[0_18px_50px_-32px_rgba(28,25,22,0.55)]',
-                (flyer || exportingGif) && 'pointer-events-none',
+                (flyer || exportingGif || autoDrawing) && 'pointer-events-none',
               )}
               style={box}
             >
