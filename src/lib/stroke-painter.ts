@@ -1,9 +1,7 @@
 import type { Contour, SpatialIndex } from '@/lib/contours'
+import { INK, PAPER, sampleInkColor } from '@/lib/ink-color'
 import { matchFinishedStroke, type StrokeMatch } from '@/lib/match-stroke'
 import { easeInOutCubic, morphPolyline, type Point } from '@/lib/polyline'
-
-const PAPER = '#fffaf3'
-const INK = '#1c1916'
 
 /** 先停一下让人看清自己的笔，再在大约 0.8s 内变过去 */
 const HOLD_MS = 200
@@ -260,17 +258,7 @@ export class StrokePainter {
   }
 
   private sampleColor(x: number, y: number): string {
-    const data = this.colorData
-    if (!data) return INK
-    const ix = Math.min(data.width - 1, Math.max(0, Math.round(x)))
-    const iy = Math.min(data.height - 1, Math.max(0, Math.round(y)))
-    const o = (iy * data.width + ix) * 4
-    const r = data.data[o]
-    const g = data.data[o + 1]
-    const b = data.data[o + 2]
-    const luma = 0.299 * r + 0.587 * g + 0.114 * b
-    if (luma > 228) return INK
-    return `rgb(${r},${g},${b})`
+    return sampleInkColor(this.colorData, x, y)
   }
 
   private paintStroke(
