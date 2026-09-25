@@ -24,8 +24,8 @@ import { SAMPLE_IMAGE_SRC } from '@/lib/sample'
 import { pointerToCanvas, StrokePainter } from '@/lib/stroke-painter'
 import { cn } from '@/lib/utils'
 
-/** 线条细节固定为 0，页面上不再提供调节。 */
-const LINE_DETAIL = 0
+/** 线条细节固定为 50，页面上不再提供调节。 */
+const LINE_DETAIL = 50
 const LINE_HOLD_MS = 1600
 const LINE_SHRINK_MS = 1600
 
