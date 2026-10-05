@@ -13,18 +13,86 @@ type Phase = 'hold' | 'morph' | 'fade' | 'trace' | 'done'
 /** 自动完成整段大约这么久，长线多占一点时间。 */
 const AUTO_MS = 7000
 
+type AutoPiece = {
+  points: Point[]
+  contourId: number
+  spans: Array<[number, number]>
+}
+
+/** 把连续下标收成区间。跨过闭合线起点时会拆成多段。 */
+function spansOf(indices: number[]): Array<[number, number]> {
+  if (indices.length === 0) return []
+  const spans: Array<[number, number]> = []
+  let lo = indices[0]
+  let hi = indices[0]
+  for (let k = 1; k < indices.length; k++) {
+    const index = indices[k]
+    if (index === hi + 1 || index === lo - 1) {
+      lo = Math.min(lo, index)
+      hi = Math.max(hi, index)
+      continue
+    }
+    spans.push([lo, hi])
+    lo = index
+    hi = index
+  }
+  spans.push([lo, hi])
+  return spans
+}
+
+/** 一条轮廓上还没被手画占用的点，闭合流会把跨过起点的空段接成一笔。 */
+function freePieces(contour: Contour, mask: Uint8Array | undefined): AutoPiece[] {
+  const n = contour.points.length
+  if (n < 2) return []
+  const runs: number[][] = []
+  if (!mask) {
+    runs.push(Array.from({ length: n }, (_, index) => index))
+  } else {
+    let run: number[] = []
+    for (let i = 0; i < n; i++) {
+      if (mask[i]) {
+        if (run.length > 0) runs.push(run)
+        run = []
+        continue
+      }
+      run.push(i)
+    }
+    if (run.length > 0) runs.push(run)
+    const head = runs[0]
+    const tail = runs[runs.length - 1]
+    if (
+      contour.closed &&
+      runs.length >= 2 &&
+      head[0] === 0 &&
+      tail[tail.length - 1] === n - 1
+    ) {
+      runs[0] = tail.concat(head)
+      runs.pop()
+    }
+  }
+  const pieces: AutoPiece[] = []
+  for (const indices of runs) {
+    if (indices.length < 2) continue
+    const points = indices.map((index) => ({
+      x: contour.points[index].x,
+      y: contour.points[index].y,
+    }))
+    if (arcLength(points) < 2) continue
+    pieces.push({ points, contourId: contour.id, spans: spansOf(indices) })
+  }
+  return pieces
+}
+
 /**
  * 长线优先，同时靠外的线优先。两项都归一化后相加，避免只按其中一个排。
  * 靠外看的是离画面重心最远的点，这样绕着主体的外轮廓会排在五官前面。
  */
-function orderContours(contours: Contour[]): Contour[] {
-  const usable = contours.filter((contour) => contour.points.length >= 2)
-  if (usable.length === 0) return []
+function orderPieces(pieces: AutoPiece[], contours: Contour[]): AutoPiece[] {
+  if (pieces.length === 0) return []
   let sx = 0
   let sy = 0
   let count = 0
-  const lengths = usable.map((contour) => arcLength(contour.points))
-  for (const contour of usable) {
+  for (const contour of contours) {
     for (const point of contour.points) {
       sx += point.x
       sy += point.y
@@ -33,25 +101,28 @@ function orderContours(contours: Contour[]): Contour[] {
   }
   const cx = count ? sx / count : 0
   const cy = count ? sy / count : 0
-  let maxLen = 1
-  let maxReach = 1
-  const reaches = usable.map((contour, index) => {
+  const lengths = pieces.map((piece) => arcLength(piece.points))
+  const reaches = pieces.map((piece) => {
     let far = 0
-    for (const point of contour.points) {
+    for (const point of piece.points) {
       const dist = Math.hypot(point.x - cx, point.y - cy)
       if (dist > far) far = dist
     }
-    if (lengths[index] > maxLen) maxLen = lengths[index]
-    if (far > maxReach) maxReach = far
     return far
   })
-  return usable
-    .map((contour, index) => ({
-      contour,
+  let maxLen = 1
+  let maxReach = 1
+  for (let i = 0; i < pieces.length; i++) {
+    if (lengths[i] > maxLen) maxLen = lengths[i]
+    if (reaches[i] > maxReach) maxReach = reaches[i]
+  }
+  return pieces
+    .map((piece, index) => ({
+      piece,
       score: lengths[index] / maxLen + reaches[index] / maxReach,
     }))
     .sort((a, b) => b.score - a.score)
-    .map((item) => item.contour)
+    .map((item) => item.piece)
 }
 
 export type ReplayPiece = {
@@ -115,7 +186,7 @@ export class StrokePainter {
   debugMatchCount = 0
   private animFrame = 0
   private lastNow = 0
-  private autoQueue: Contour[] = []
+  private autoQueue: AutoPiece[] = []
   private autoDurations: number[] = []
   private autoOnDone: (() => void) | null = null
   width = 0
@@ -275,20 +346,34 @@ export class StrokePainter {
     this.finishAuto(true)
   }
 
-  /** 按长到短、外到内的综合顺序，把还没画过的轮廓描出来。 */
+  /** 按长到短、外到内的综合顺序，把还没被手画盖住的轮廓段描出来。 */
   startAutoDraw(onDone: () => void): boolean {
     if (this.autoOnDone || this.autoQueue.length > 0) return false
-    const taken = new Set(
-      this.strokes
-        .filter((stroke) => stroke.epoch === this.epoch)
-        .flatMap((stroke) => stroke.pieces.map((piece) => piece.contourId)),
+    const masks = new Map<number, Uint8Array>()
+    for (const stroke of this.strokes) {
+      if (stroke.epoch !== this.epoch) continue
+      for (const piece of stroke.pieces) {
+        const contour = this.contours.find((item) => item.id === piece.contourId)
+        if (!contour || piece.spans.length === 0) continue
+        let mask = masks.get(piece.contourId)
+        if (!mask) {
+          mask = new Uint8Array(contour.points.length)
+          masks.set(piece.contourId, mask)
+        }
+        const n = mask.length
+        for (const [a, b] of piece.spans) {
+          const lo = Math.max(0, Math.min(n - 1, Math.min(a, b)))
+          const hi = Math.max(0, Math.min(n - 1, Math.max(a, b)))
+          for (let i = lo; i <= hi; i++) mask[i] = 1
+        }
+      }
+    }
+    const pieces = orderPieces(
+      this.contours.flatMap((contour) => freePieces(contour, masks.get(contour.id))),
+      this.contours,
     )
-    const ordered = orderContours(this.contours).filter((contour) => {
-      if (taken.has(contour.id)) return false
-      return contour.points.length >= 2 && arcLength(contour.points) >= 2
-    })
-    if (ordered.length === 0) return false
-    const lengths = ordered.map((contour) => arcLength(contour.points))
+    if (pieces.length === 0) return false
+    const lengths = pieces.map((piece) => arcLength(piece.points))
     const sum = lengths.reduce((total, len) => total + len, 0) || 1
     let durations = lengths.map((len) => Math.max(16, (AUTO_MS * len) / sum))
     const planned = durations.reduce((total, len) => total + len, 0)
@@ -296,7 +381,7 @@ export class StrokePainter {
       const scale = AUTO_MS / planned
       durations = durations.map((len) => Math.max(12, len * scale))
     }
-    this.autoQueue = ordered
+    this.autoQueue = pieces
     this.autoDurations = durations
     this.autoOnDone = onDone
     this.pumpAuto()
@@ -361,18 +446,18 @@ export class StrokePainter {
   private pumpAuto() {
     const width = inkWidth(this.snapRadius)
     while (this.autoQueue.length > 0) {
-      const contour = this.autoQueue.shift()
+      const piece = this.autoQueue.shift()
       const duration = this.autoDurations.shift() ?? 40
-      if (!contour || contour.points.length < 2) continue
-      const pts = contour.points.map((point) => ({ x: point.x, y: point.y }))
+      if (!piece || piece.points.length < 2) continue
+      const pts = piece.points.map((point) => ({ x: point.x, y: point.y }))
       this.strokes.push({
         raw: pts,
         pieces: [
           {
             source: pts,
             target: pts,
-            contourId: contour.id,
-            spans: [[0, pts.length - 1]],
+            contourId: piece.contourId,
+            spans: piece.spans,
           },
         ],
         display: [[{ x: pts[0].x, y: pts[0].y }]],
